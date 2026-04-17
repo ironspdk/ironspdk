@@ -1,0 +1,17 @@
+[package]
+name = "ironspdk"
+version = "0.1.1"
+authors = ["Eugene Korenevsky <ekorenevsky@aliyun.com>"]
+license = "Apache-2.0 OR BSD-3-Clause"
+description = "ironspdk (Rust runtime for SPDK)"
+edition = "2024"
+
+[dependencies]
+ctor = "0.6.3"
+env_logger = "0.11.8"
+log = "0.4.29"
+num_enum = "0.7.5"
+parking_lot = "0.12.5"
+paste = "1.0.15"
+serde_json = "1.0.149"
+thiserror = "2.0.17"

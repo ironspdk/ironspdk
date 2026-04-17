@@ -1,0 +1,14 @@
+[package]
+name = "ironspdk-sys"
+version = "0.1.1"
+authors = ["Eugene Korenevsky <ekorenevsky@aliyun.com>"]
+license = "Apache-2.0 OR BSD-3-Clause"
+description = "ironspdk SPDK FFI bindings and wrappers"
+edition = "2024"
+links = "ironspdk-sys"
+
+[build-dependencies]
+cc = "1.2.56"
+
+[dependencies]
+glob = "0.3"
