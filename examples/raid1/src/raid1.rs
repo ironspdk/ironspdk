@@ -53,12 +53,6 @@ struct Raid1IoChannel {
     next_read: usize,
 }
 
-impl Drop for Raid1IoChannel {
-    fn drop(&mut self) {
-        debug!("DROP Raid1IoChannel {:p}", &self);
-    }
-}
-
 struct Raid1Bdev {
     name: String,
     children_names: Vec<String>,
@@ -67,6 +61,7 @@ struct Raid1Bdev {
 
 impl Drop for Raid1Bdev {
     fn drop(&mut self) {
+        // Need to stop all workers. This is mandatory.
         for w in &self.workers {
             w.request_exit();
         }
