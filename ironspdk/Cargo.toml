@@ -3,6 +3,7 @@ name = "ironspdk"
 version = "0.1.3"
 authors = ["Eugene Korenevsky <ekorenevsky@aliyun.com>"]
 license = "Apache-2.0 OR BSD-3-Clause"
+repository = "https://github.com/ironspdk/ironspdk"
 description = "ironspdk (Rust runtime for SPDK)"
 edition = "2024"
 
