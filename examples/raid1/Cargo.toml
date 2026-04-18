@@ -11,7 +11,7 @@ cc = "1.2.56"
 # NOTE! This is specific to workspace example, so local paths are used.
 
 # In your projects, you should write here:
-#    ironspdk-sys = "0.1.1"
+#    ironspdk-sys = "0.1"
 
 ironspdk-sys = { path = "../../ironspdk-sys" }
 
@@ -22,8 +22,8 @@ log = "0.4.29"
 paste = "1.0.15"
 
 # In your projects, you should write here:
-#    ironspdk-sys = "0.1.1"
-#    ironspdk = "0.1.1"
+#    ironspdk-sys = "0.1"
+#    ironspdk = "0.1"
 
 ironspdk-sys = { path = "../../ironspdk-sys" }
 ironspdk = { path = "../../ironspdk" }
