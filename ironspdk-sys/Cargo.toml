@@ -1,6 +1,6 @@
 [package]
 name = "ironspdk-sys"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Eugene Korenevsky <ekorenevsky@aliyun.com>"]
 license = "Apache-2.0 OR BSD-3-Clause"
 description = "ironspdk SPDK FFI bindings and wrappers"
