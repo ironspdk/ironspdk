@@ -20,13 +20,14 @@ A cutting-edge Rust runtime that brings the power of modern async/await to SPDK 
 * **Tight runtime integration**: The `ironspdk` runtime executor extends the SPDK poller, allowing Rust code to seamlessly integrate with the SPDK event loop
 * **Zero-copy I/O**: Work directly with SPDK I/O vectors and DMA buffers
 * **Thread-safe operations**: The Rust type system enforces SPDK's multiple-threads-no-locks programming model at compile time
+* **C <-> Rust interoperability**: SPDK (or any other library) C API is still here: just add `unsafe extern "C" spdk_...(...);` to your Rust code
 
 ### 🚀 Performance
 * **C-level performance**: No runtime overhead - compiled to native code with optimizations
 * **Lock-free design**: Leverages SPDK's thread-per-core architecture
 * **Direct FFI binding**: Minimal abstraction over underlying SPDK C APIs
 
-### 📦 Comprehensive I/O Abstractions
+### 🔀 Comprehensive I/O Abstractions
 * **Multiple I/O models**: Support for I/O references (`IoRef`), buffered I/O (`IoBuf`), and unified `Io` enum
 * **I/O splitting**: Advanced utilities for splitting and reordering I/O operations
 * **DMA buffers**: First-class support for aligned DMA memory allocation and management
