@@ -3,8 +3,7 @@
 #![allow(non_snake_case)]
 
 use ctor::ctor;
-use log::debug;
-use log::error;
+use log::{debug, error, warn};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use parking_lot::{Mutex, RwLock};
 use paste::paste;
@@ -788,8 +787,14 @@ extern "C" fn rsu_io_channel_destroy(ctxt: *mut c_void) {
 extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: i32) -> bool {
     debug_assert!(!bdev_ctxt.is_null());
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
-    let io_type = IoType::try_from_c(c_io_type)
-        .unwrap_or_else(|_| panic!("Invalid C io type: {}", c_io_type));
+    let io_type = match IoType::try_from_c(c_io_type) {
+        Ok(io_type) => io_type,
+        // Maybe new SPDK I/O type, not suported by ironspdk. Return 'false'
+        _ => {
+            warn!("Unsupported C io type: {}", c_io_type);
+            return false;
+        }
+    };
     let bdev = ctx.bdev.clone();
     bdev.io_type_supported(io_type)
 }
