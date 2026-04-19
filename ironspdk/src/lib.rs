@@ -131,6 +131,7 @@ c_enum! {
         Copy        = c::SPDK_BDEV_IO_TYPE_COPY,
         NvmeIovMd   = c::SPDK_BDEV_IO_TYPE_NVME_IOV_MD,
         NvmeNssr    = c::SPDK_BDEV_IO_TYPE_NVME_NSSR,
+        WriteUncorrectable = c::SPDK_BDEV_IO_TYPE_WRITE_UNCORRECTABLE,
     }
 }
 

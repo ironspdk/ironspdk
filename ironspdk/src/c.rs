@@ -45,6 +45,7 @@ pub const SPDK_BDEV_IO_TYPE_SEEK_DATA: spdk_bdev_io_type = 18;
 pub const SPDK_BDEV_IO_TYPE_COPY: spdk_bdev_io_type = 19;
 pub const SPDK_BDEV_IO_TYPE_NVME_IOV_MD: spdk_bdev_io_type = 20;
 pub const SPDK_BDEV_IO_TYPE_NVME_NSSR: spdk_bdev_io_type = 21;
+pub const SPDK_BDEV_IO_TYPE_WRITE_UNCORRECTABLE: spdk_bdev_io_type = 22;
 
 // enum spdk_bdev_event_type
 pub const SPDK_BDEV_EVENT_REMOVE: i32 = 0;
