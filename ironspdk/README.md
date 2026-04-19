@@ -51,7 +51,7 @@ examples/raid1/        # Simple RAID1 implementation example
 ### Runtime Executor
 
 The `ironspdk` runtime leverages SPDK's poller mechanism:
-- **Task Control Block (Tcb)**: Manages async task execution on each SPDK thread
+- **Thread Control Block (Tcb)**: Manages async task execution on each SPDK thread
 - **Task scheduler**: Queues and polls futures
 - **I/O channel management**: Tracks and manages block device I/O channels per thread
 - **Waker integration**: Custom waker implementation to notify tasks in runqueue
@@ -73,6 +73,8 @@ ironspdk = "0.1"
 ```
 
 ### Create a Simple Block Device
+
+Simplified code of `ironspdk` block device:
 
 ```rust
 use ironspdk::{Bdev, BdevIoChannel, BdevIo, IoType, SpdkThread, RawBdevHandle};
@@ -109,6 +111,8 @@ impl Bdev for MyBdev {
 }
 ```
 
+See `examples/` for exact implementations.
+
 ### Build & Run
 
 ```bash
@@ -132,7 +136,7 @@ The repository includes a simple yet functional RAID1 implementation (`examples/
 - Handling read/write operations
 - RPC-based management interface
 
-**Compare with SPDK's C implementation**: The Rust version is significantly more concise and readable, while maintaining identical performance.
+**Compare with SPDK's C implementation `raid1.c`**: The Rust version is significantly more concise and readable, while maintaining identical performance.
 
 #### Running the RAID1 Example
 
@@ -196,7 +200,7 @@ Wrapper around SPDK threads. Enables spawning async tasks and inter-thread commu
 // create new SPDK thread at core 2
 let thread = SpdkThread::new_at_cores("my_thread", [2]);
 
-// run some code at this SPDK thread
+// run some code at this SPDK thread asynchronously
 thread.spawn(async { /* async work */ });
 
 // stop SPDK threads this way only
@@ -228,6 +232,7 @@ impl BdevIo {
     pub fn block_len(&self) -> usize;
     pub fn range(&self) -> Option<IoRange>;
     pub fn complete(&self, status: IoStatus);
+    pub fn complete_on(self, thread: &SpdkThread, status: IoStatus);
 }
 ```
 
