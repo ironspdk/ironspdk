@@ -830,7 +830,7 @@ extern "C" fn poller_fn(ctx: *mut c_void) -> i32 {
     let tcb = unsafe { &mut *(ctx as *mut Tcb) };
 
     // Normal execution
-    // Is poll() detects thread is exited, it unregisters the poller
+    // If poll() detects thread is exited, it unregisters the poller
     if tcb.poll() {
         1 // busy
     } else {
