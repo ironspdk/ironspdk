@@ -67,7 +67,7 @@ pub enum Error {
 }
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
-pub(crate) struct BdevId(usize);
+pub struct BdevId(usize);
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
 struct ThreadKey(usize);
@@ -879,7 +879,7 @@ impl CpuSet {
     }
 
     /// Expose raw pointer for FFI
-    pub(crate) fn as_ptr(&self) -> *const c::spdk_cpuset {
+    pub fn as_ptr(&self) -> *const c::spdk_cpuset {
         self.raw.as_ptr()
     }
 }
