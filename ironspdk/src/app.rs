@@ -82,10 +82,10 @@ impl SpdkApp {
                 Some(cb) => Box::into_raw(Box::new(cb)) as *mut c_void,
                 None => ptr::null_mut(),
             };
-            c::u_spdk_app_set_shutdown_cb(opts, unsafe_spdk_app_shutdown);
+            c::u_spdk_app_set_shutdown_cb(opts, u_spdk_app_shutdown);
         }
 
-        let rc = unsafe { c::u_spdk_app_start(opts, unsafe_spdk_app_start, start_cx) };
+        let rc = unsafe { c::u_spdk_app_start(opts, u_spdk_app_start, start_cx) };
         if rc != 0 {
             return Err(Error::Start(rc));
         }
@@ -94,8 +94,8 @@ impl SpdkApp {
     }
 }
 
-/// Unsafe shutdown routine. Performs unsafe shutdown operations and calls shutdown()
-extern "C" fn unsafe_spdk_app_shutdown() {
+/// Unsafe shutdown callback. Performs unsafe shutdown operations and stops app
+extern "C" fn u_spdk_app_shutdown() {
     if !(unsafe { SHUTDOWN_CX.is_null() }) {
         let cb = unsafe { Box::from_raw(SHUTDOWN_CX as *mut Box<dyn FnOnce()>) };
         cb();
@@ -103,7 +103,8 @@ extern "C" fn unsafe_spdk_app_shutdown() {
     unsafe { c::u_spdk_app_stop(0) };
 }
 
-extern "C" fn unsafe_spdk_app_start(cx: *mut c_void) {
+/// Unsafe start trampoline
+extern "C" fn u_spdk_app_start(cx: *mut c_void) {
     assert!(!cx.is_null());
     let cb = unsafe { Box::from_raw(cx as *mut Box<dyn FnOnce()>) };
     cb();
