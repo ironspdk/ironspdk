@@ -33,6 +33,7 @@ pub use app::*;
 pub mod rpc;
 
 static BDEV_REGISTRY: OnceLock<Mutex<HashMap<String, BdevHandle>>> = OnceLock::new();
+static TCB_REGISTRY: OnceLock<RwLock<HashMap<ThreadKey, TcbPtr>>> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -90,8 +91,6 @@ impl TcbPtr {
         self.0
     }
 }
-
-static TCB_REGISTRY: OnceLock<RwLock<HashMap<ThreadKey, TcbPtr>>> = OnceLock::new();
 
 fn tcb_registry() -> &'static RwLock<HashMap<ThreadKey, TcbPtr>> {
     TCB_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
