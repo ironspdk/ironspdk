@@ -85,6 +85,8 @@ fn emit_link_spdk(pkgcfg_metas: &[String]) {
 
     // Link with liburing (to fix linking bug on some environments)
     println!("cargo:rustc-link-arg=-luring");
+    // Link with libkeyutils (to fix linking on SPDK 26.09.0-pre)
+    println!("cargo:rustc-link-arg=-lkeyutils");
 }
 
 fn ironspdk_sys_out_dir() -> String {
