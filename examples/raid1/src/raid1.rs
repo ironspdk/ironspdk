@@ -7,7 +7,7 @@ use ironspdk::{
     Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, Io, IoFuture, IoStatus, IoType, Lbdev,
     LbdevIoChannel, RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, Tcb, thread_id,
 };
-use log::debug;
+use log::{debug, error};
 use paste::paste;
 use std::cell::{Cell, UnsafeCell};
 use std::os::raw::{c_char, c_void};
@@ -159,21 +159,30 @@ impl Raid1Bdev {
         let n = ch.children.len();
         debug_assert!(ch.chans.len() == n);
 
-        // round-robin read
-        let next = (ch.next_read + 1) % n;
-        ch.next_read = next;
-        // TODO read from next child on failure
+        let mut status = IoStatus::Failure;
 
-        let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
-        let res = ch.children[next].read(&ch.chans[next], ioref);
+        for _ in 0..n {
+            // round-robin read
+            let next = (ch.next_read + 1) % n;
+            ch.next_read = next;
 
-        res.future().await;
+            let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
+            let res = ch.children[next].read(&ch.chans[next], ioref);
+            res.future().await;
 
-        let status = if res.success() {
-            IoStatus::Success
-        } else {
-            IoStatus::Failure
-        };
+            if res.success() {
+                status = IoStatus::Success;
+                break;
+            }
+
+            // Failover. Read from next child.
+            debug!("FAILOVER #{} {} {:?}", thread_id(), next, io);
+        }
+
+        if status == IoStatus::Failure {
+            error!("Read error (all children failed) #{} {:?}", thread_id(), io);
+        }
+
         io.complete_on(sender_thread, status);
     }
 
