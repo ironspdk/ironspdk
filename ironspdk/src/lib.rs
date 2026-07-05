@@ -133,6 +133,7 @@ c_enum! {
     }
 }
 
+#[derive(Debug)]
 struct DmaBufInner {
     ptr: NonNull<u8>,
     len: usize,
@@ -149,7 +150,7 @@ impl Drop for DmaBufInner {
 
 /// Data buffer allocated from DMA memory.
 /// It may be shared between threads, so it implements Send+Sync+Clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DmaBuf {
     inner: Arc<DmaBufInner>,
 }
@@ -195,6 +196,7 @@ impl DmaBuf {
     }
 }
 
+#[derive(Debug)]
 pub struct IoRef<'a> {
     data_iovs: Vec<c::iovec>,
     offset_blocks: u64, // LBA
@@ -283,6 +285,7 @@ impl<'a> IoRef<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct IoBuf {
     data: DmaBuf,
     offset_blocks: u64,
@@ -425,6 +428,7 @@ impl<'a> IoRefSplitter<'a> {
     }
 }
 
+#[derive(Debug)]
 pub enum Io<'a> {
     Ref(IoRef<'a>),
     Buf(IoBuf),
@@ -506,6 +510,7 @@ pub struct IoRange {
     num_blocks: u64,
 }
 
+#[derive(PartialEq)]
 pub enum IoStatus {
     Success,
     Failure,
@@ -520,6 +525,19 @@ pub struct BdevIo {
     // BdevIo is immutable by nature, but related future must be mutable.
     // That's why we use UnsafeCell here
     fut: UnsafeCell<IoFuture>,
+}
+
+impl std::fmt::Debug for BdevIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BdevIo(raw:{:p}, {:#?}, of={} num={})",
+            self.raw,
+            self.io_type(),
+            self.offset_blocks(),
+            self.num_blocks()
+        )
+    }
 }
 
 impl BdevIo {
@@ -630,7 +648,7 @@ pub struct RcBdevIoChannel {
 impl std::fmt::Debug for RcBdevIoChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let refcnt = unsafe { c::spdk_io_channel_get_ref_count(self.raw.as_ptr()) };
-        write!(f, "raw: {:p}, ref: {}", self.raw, refcnt)
+        write!(f, "RcBdevIoChannel(raw: {:p}, ref: {})", self.raw, refcnt)
     }
 }
 

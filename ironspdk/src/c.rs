@@ -5,7 +5,7 @@ use std::os::raw::{c_char, c_int, c_void};
 //////////////////////////////////////////////////////////////
 
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct iovec {
     pub iov_base: *mut c_void,
     pub iov_len: usize,
