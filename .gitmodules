@@ -1,0 +1,3 @@
+[submodule "extern/spdk"]
+	path = extern/spdk
+	url = https://github.com/spdk/spdk
