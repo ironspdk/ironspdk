@@ -25,6 +25,8 @@ jobs:
 
       - name: Build
         run: |
+          SPDK=./extern/spdk
+          sudo $SPDK/scripts/pkgdep.sh
           make
 
       - name: Start SPDK
@@ -79,9 +81,11 @@ jobs:
           sudo PYTHONPATH=./scripts \
             $SPDK/scripts/rpc.py --plugin ironspdk rs_bdev_delete r1 || true
           for i in 0 1 2 3; do
-            sudo $SPDK/scripts/rpc.py bdev_malloc_delete -b malloc${i} || true
+            sudo $SPDK/scripts/rpc.py bdev_malloc_delete malloc${i} || true
           done
           sudo kill $(cat spdk.pid) || true
-          echo "*** SPDK log: ***"
-          cat spdk.log
+          if [ -f spdk.log ]; then
+            echo "*** SPDK log: ***"
+            cat spdk.log
+          fi
           echo "***    End    ***"
