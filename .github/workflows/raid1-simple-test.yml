@@ -27,7 +27,7 @@ jobs:
         run: |
           SPDK=./extern/spdk
           sudo $SPDK/scripts/pkgdep.sh
-          make
+          make test-build
 
       - name: Start SPDK
         run: |

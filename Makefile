@@ -13,14 +13,18 @@ NPROC := $(shell nproc 2>/dev/null || echo 1)
 
 .PHONY: all release spdk check-spdk clean distclean
 
-# Default target: ensure SPDK built (if needed), then build the crate
-all: check-spdk
+cargo-build-debug:
 	@echo "Building ironspdk rust crate (debug)"
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo build
+
+# Default target: ensure SPDK built (if needed), then build the crate
+all: check-spdk cargo-build-debug
 
 release: check-spdk
 	@echo "Building ironspdk rust crate (release)"
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo build --release
+
+test-build: build-test-spdk cargo-build-debug
 
 # check-spdk: checks if SPDK build outputs look present; if not, invoke spdk
 check-spdk:
@@ -40,6 +44,12 @@ spdk:
 	@# Ensure an out-of-source build dir exists; SPDK configure may populate build/ under the source tree.
 	mkdir -p $(SPDK)/build
 	cd $(SPDK) && ./configure --with-vhost --with-ublk --with-uring --with-raid5f
+	cd $(SPDK) && make -j $(NPROC)
+
+build-test-spdk:
+	@echo "Building SPDK from $(SPDK) (configure+make run in $(SPDK))..."
+	mkdir -p $(SPDK)/build
+	cd $(SPDK) && ./configure --with-raid5f
 	cd $(SPDK) && make -j $(NPROC)
 
 clean-spdk:
