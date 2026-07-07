@@ -23,6 +23,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fio nbd-client
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build
         run: |
           SPDK=./extern/spdk
