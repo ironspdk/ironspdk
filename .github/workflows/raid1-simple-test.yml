@@ -2,6 +2,10 @@ name: RAID1 simple test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master
+      - raid-simple-tesit
 
 jobs:
   raid1-simple-test:
