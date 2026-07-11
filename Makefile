@@ -13,12 +13,12 @@ NPROC := $(shell nproc 2>/dev/null || echo 1)
 
 .PHONY: all release spdk check-spdk clean distclean
 
+# Default target: ensure SPDK built (if needed), then build the crate
+all: check-spdk cargo-build-debug
+
 cargo-build-debug:
 	@echo "Building ironspdk rust crate (debug)"
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo build
-
-# Default target: ensure SPDK built (if needed), then build the crate
-all: check-spdk cargo-build-debug
 
 release: check-spdk
 	@echo "Building ironspdk rust crate (release)"
