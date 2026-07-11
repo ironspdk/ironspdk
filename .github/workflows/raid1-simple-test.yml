@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - master
-      - raid-simple-tesit
+      - raid-simple-test
 
 jobs:
   raid1-simple-test:
