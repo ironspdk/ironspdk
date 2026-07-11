@@ -65,6 +65,8 @@ pub enum Error {
     OutOfRange,
     #[error("Integer downcast error")]
     IntDowncast,
+    #[error("Integer parse error")]
+    IntParseError(#[from] std::num::ParseIntError),
 }
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
@@ -1290,8 +1292,11 @@ impl BdevDesc {
     }
 
     pub fn block_len(&self) -> usize {
-        let bdev = self.bdev();
-        (unsafe { c::u_bdev_get_blocklen(bdev) }) as usize
+        (unsafe { c::u_bdev_get_blocklen(self.bdev()) }) as usize
+    }
+
+    pub fn number_of_blocks(&self) -> u64 {
+        unsafe { c::u_bdev_get_blockcnt(self.bdev()) }
     }
 }
 
@@ -1376,6 +1381,10 @@ impl Lbdev {
             name: name.to_string(),
             desc,
         })
+    }
+
+    pub fn desc(&self) -> &BdevDesc {
+        &self.desc
     }
 
     pub fn get_io_channel(&self) -> Rc<LbdevIoChannel> {

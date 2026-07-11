@@ -31,6 +31,11 @@ uint32_t u_bdev_get_blocklen(struct spdk_bdev *bdev)
     return bdev->blocklen;
 }
 
+uint32_t u_bdev_get_blockcnt(struct spdk_bdev *bdev)
+{
+    return bdev->blockcnt;
+}
+
 void u_bdev_io_get_iovec(struct spdk_bdev_io *bdev_io,
                          struct iovec **iovp, int *iovcntp)
 {

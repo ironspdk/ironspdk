@@ -105,6 +105,8 @@ unsafe extern "C" {
 
     pub fn u_bdev_get_blocklen(io: *const spdk_bdev) -> u32;
 
+    pub fn u_bdev_get_blockcnt(io: *const spdk_bdev) -> u64;
+
     pub fn u_spdk_bdev_delete_by_name(name: *const c_char) -> i32;
 
     pub fn u_io_channel_get_rust_ctx(spdk_ch_ctx: *mut c_void) -> *mut c_void;

@@ -55,6 +55,13 @@ struct Raid1IoChannel {
 
 struct Raid1Bdev {
     name: String,
+
+    /// Strip size, bytes
+    strip_size: usize,
+
+    /// Block length, bytes
+    blocklen: usize,
+
     children_names: Vec<String>,
     workers: Vec<SpdkThread>,
 }
@@ -133,7 +140,12 @@ impl Bdev for Raid1Bdev {
 }
 
 impl Raid1Bdev {
-    pub fn new(name: &str, children_names: Vec<&str>) -> Result<Self, Error> {
+    pub fn new(
+        name: &str,
+        blocklen: usize,
+        strip_size: usize,
+        children_names: Vec<&str>,
+    ) -> Result<Self, Error> {
         let n = SpdkThread::core_count();
         let mut workers = Vec::with_capacity(n as usize);
         for core in 0..n {
@@ -144,13 +156,16 @@ impl Raid1Bdev {
         }
         Ok(Self {
             name: name.to_string(),
+            strip_size,
+            blocklen,
             children_names: children_names.iter().map(|&s| s.to_string()).collect(),
             workers,
         })
     }
 
     fn owner_thread_idx(&self, off: u64) -> usize {
-        ((off / 0x100) % (self.workers.len() as u64)) as usize
+        let strip_size_in_blocks = (self.strip_size / self.blocklen) as u64;
+        ((off / strip_size_in_blocks) % (self.workers.len() as u64)) as usize
     }
 
     async fn submit_read(&self, sender_thread: &SpdkThread, ch: &mut Raid1IoChannel, io: BdevIo) {
@@ -214,6 +229,9 @@ impl Raid1Bdev {
     }
 }
 
+/// Default strip size (if not specified in arguments), bytes
+const DEFAULT_STRIP_SIZE: usize = 128 * 1024;
+
 define_bdev_opts!(Raid1BdevOpts {
     blocklen: u32 = 512,                    // default: 512 bytes
     blockcnt: u64 = 64 * 1024 * 1024 / 512, // default: 64 MBytes
@@ -228,12 +246,65 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+fn parse_strip_size(args: rpc::RpcCmdArgs, blocklen: usize) -> Result<usize, Error> {
+    let strip_size_kb = if let Some(strip_size_kb_str) = args.get("strip-size-kb") {
+        strip_size_kb_str.parse::<u32>()?
+    } else {
+        0
+    };
+    let mut strip_size = (strip_size_kb * 1024) as usize;
+    if strip_size == 0 {
+        strip_size = DEFAULT_STRIP_SIZE / blocklen * blocklen;
+    }
+    if strip_size.is_multiple_of(blocklen) {
+        Ok(strip_size)
+    } else {
+        Err(Error::InvalidArguments)
+    }
+}
+
+fn parse_children(children_names: &Vec<&str>) -> Result<(usize, u64), Error> {
+    let mut blocklen: Option<usize> = None;
+    let mut num_blocks: Option<u64> = None;
+    if children_names.is_empty() {
+        return Err(Error::InvalidArguments);
+    }
+    for cname in children_names {
+        match Lbdev::open(cname) {
+            Ok(dev) => {
+                let bdev_blocklen = dev.desc().block_len();
+                match blocklen {
+                    None => blocklen = Some(bdev_blocklen),
+                    Some(existing) if existing != bdev_blocklen => {
+                        return Err(Error::InvalidArguments);
+                    }
+                    _ => {}
+                }
+                let bdev_num_blocks = dev.desc().number_of_blocks();
+                match num_blocks {
+                    None => num_blocks = Some(bdev_num_blocks),
+                    Some(existing) if existing != bdev_num_blocks => {
+                        return Err(Error::InvalidArguments);
+                    }
+                    _ => {}
+                }
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        }
+    }
+    Ok((blocklen.unwrap(), num_blocks.unwrap()))
+}
+
 fn rpc_rs_raid1_create(args: rpc::RpcCmdArgs) -> rpc::RpcCmdResult {
     let name = args.get("name").ok_or(Error::InvalidArguments)?;
     let children_names_cs = args.get("children").ok_or(Error::InvalidArguments)?;
     let children_names: Vec<&str> = children_names_cs.split(',').collect();
+    let (blocklen, num_blocks) = parse_children(&children_names)?;
+    let strip_size = parse_strip_size(args.clone(), blocklen)?;
 
-    let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, children_names)?);
+    let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, blocklen, strip_size, children_names)?);
 
     ironspdk::bdev_registry_add(name.to_string(), bdevh.clone())?;
 
@@ -243,10 +314,9 @@ fn rpc_rs_raid1_create(args: rpc::RpcCmdArgs) -> rpc::RpcCmdResult {
         spdk_bdev: std::ptr::null_mut(),
     });
 
-    let opts = Raid1BdevOpts::from_rpc(&args)?;
-
-    // TODO: open children, get their blocklen and blockcnt; validate and
-    // set up corresponding opts fields
+    let mut opts = Raid1BdevOpts::from_rpc(&args)?;
+    opts.blockcnt = num_blocks;
+    opts.blocklen = blocklen as u32;
 
     let opts_c = opts.to_c();
     let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
