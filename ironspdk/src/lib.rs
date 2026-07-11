@@ -1450,6 +1450,7 @@ impl Lbdev {
 
 /// SPDK bdev options placeholder. Should be used with define_bdev_opts!
 /// macro to generate code which converts RPC arguments to bdev options
+/// Put here fields of 'struct spdk_bdev' which may be passed as RPC arguments
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SpdkBdevOptsC {
@@ -1457,6 +1458,15 @@ pub struct SpdkBdevOptsC {
     pub blockcnt: u64,
     pub write_cache: bool,
     pub phys_blocklen: u32,
+    pub md_interleave: u32,
+    pub dif_is_head_of_md: u32,
+    pub write_unit_size: u32,
+    pub optimal_io_boundary: u32,
+    pub preferred_write_alignment: u32,
+    pub preferred_write_granularity: u32,
+    pub optimal_write_size: u32,
+    pub preferred_unmap_alignment: u32,
+    pub preferred_unmap_granularity: u32,
 }
 
 /// Codegen conversion from RPC arguments to bdev options
