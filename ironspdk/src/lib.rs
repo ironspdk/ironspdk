@@ -152,17 +152,39 @@ impl Drop for DmaBufInner {
 
 /// Data buffer allocated from DMA memory.
 /// It may be shared between threads, so it implements Send+Sync+Clone.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DmaBuf {
-    inner: Arc<DmaBufInner>,
+    inner: DmaBufInner,
 }
 
 impl DmaBuf {
-    pub fn new(len: usize, align: usize) -> Result<Self, Error> {
-        let ptr = unsafe { c::spdk_dma_malloc(len, align, std::ptr::null_mut()) };
+    const ALIGN_4K: usize = 4096;
+
+    pub fn new(len: usize) -> Result<Self, Error> {
+        Self::alloc(len, Self::ALIGN_4K, false)
+    }
+
+    pub fn new_aligned(len: usize, align: usize) -> Result<Self, Error> {
+        Self::alloc(len, align, false)
+    }
+
+    pub fn new_zeroed(len: usize) -> Result<Self, Error> {
+        Self::alloc(len, Self::ALIGN_4K, true)
+    }
+
+    pub fn new_aligned_zeroed(len: usize, align: usize) -> Result<Self, Error> {
+        Self::alloc(len, align, true)
+    }
+
+    fn alloc(len: usize, align: usize, zeroed: bool) -> Result<Self, Error> {
+        let ptr = if zeroed {
+            unsafe { c::spdk_dma_zmalloc(len, align, std::ptr::null_mut()) }
+        } else {
+            unsafe { c::spdk_dma_malloc(len, align, std::ptr::null_mut()) }
+        };
         let ptr = NonNull::new(ptr as *mut u8).ok_or(Error::NoMemory)?;
         Ok(Self {
-            inner: Arc::new(DmaBufInner { ptr, len }),
+            inner: DmaBufInner { ptr, len },
         })
     }
 
@@ -178,22 +200,7 @@ impl DmaBuf {
         unsafe { from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) }
     }
 
-    /// Safe mutation only if uniquely owned. Returns error otherwise.
-    pub fn as_mut_slice(&mut self) -> Result<&mut [u8], Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::SharedBufferModification)?;
-        let rc = unsafe { from_raw_parts_mut(inner.ptr.as_ptr(), self.inner.len) };
-        Ok(rc)
-    }
-
-    /// Get write access to shared buffer without checking reference count.
-    /// This is needed for performance reasons (encrypted disks as an example).
-    /// # SAFETY
-    /// It is programmer's responsibility to ensure:
-    /// - no concurrent mutable accesses
-    /// - no concurrent immutable accesses during mutation
-    /// - proper synchronization across SpdkThread-s
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn as_mut_slice_unchecked(&self) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.len) }
     }
 }
@@ -266,8 +273,8 @@ impl<'a> IoRef<'a> {
 
     pub fn to_buf(&self) -> Result<IoBuf, Error> {
         let total = self.total_bytes();
-        let mut dmabuf = DmaBuf::new(total, 64)?;
-        let data = dmabuf.as_mut_slice()?;
+        let mut dmabuf = DmaBuf::new(total)?;
+        let data = dmabuf.as_mut_slice();
         let mut dst_offset = 0;
         for iov in &self.data_iovs {
             let src = iov.iov_base as *const u8;
@@ -296,7 +303,7 @@ pub struct IoBuf {
 }
 
 impl IoBuf {
-    pub fn new(data: &DmaBuf, offset_blocks: u64, block_len: usize) -> Result<IoBuf, Error> {
+    pub fn new(data: DmaBuf, offset_blocks: u64, block_len: usize) -> Result<IoBuf, Error> {
         // check data alignment
         let data_len = data.len();
         if !data_len.is_multiple_of(block_len) {
@@ -304,7 +311,7 @@ impl IoBuf {
             return Err(Error::InvalidArguments);
         }
         Ok(Self {
-            data: data.clone(),
+            data,
             offset_blocks,
             num_blocks: data_len / block_len,
             block_len,
@@ -320,9 +327,7 @@ impl IoBuf {
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.data
-            .as_mut_slice()
-            .expect("Attempt to modify shared buffer")
+        self.data.as_mut_slice()
     }
 }
 
@@ -437,7 +442,7 @@ pub enum Io<'a> {
 }
 
 impl<'a> Io<'a> {
-    pub fn new_buf(data: &DmaBuf, offset_blocks: u64, block_len: usize) -> Result<Self, Error> {
+    pub fn new_buf(data: DmaBuf, offset_blocks: u64, block_len: usize) -> Result<Self, Error> {
         let buf = IoBuf::new(data, offset_blocks, block_len)?;
         Ok(Io::Buf(buf))
     }
@@ -1393,15 +1398,7 @@ impl Lbdev {
         Rc::new(LbdevIoChannel::new(ch))
     }
 
-    pub fn read(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        self.rwio(false, ch, io)
-    }
-
-    pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        self.rwio(true, ch, io)
-    }
-
-    fn rwio(&self, write: bool, ch: &LbdevIoChannel, mut io: Io) -> Rc<LbdevIoResult> {
+    pub fn read(&self, ch: &LbdevIoChannel, mut io: Io) -> Rc<LbdevIoResult> {
         let mut iovs_c: Vec<c::iovec> = Vec::new();
         for iov_slice in io.iter_iov_mut() {
             let iov_c = c::iovec {
@@ -1422,19 +1419,14 @@ impl Lbdev {
 
         // increase ref count for spdk_rwio_complete_cb()
         let ctx_ptr = Rc::into_raw(ctx.clone()) as *mut _;
-        let f = if write {
-            c::spdk_bdev_writev_blocks
-        } else {
-            c::spdk_bdev_readv_blocks
-        };
 
         let lba = io.offset_blocks();
         let num_blocks = io.num_blocks();
         let rc = unsafe {
-            f(
+            c::spdk_bdev_readv_blocks(
                 self.desc.raw.as_ptr(),
                 ch.raw.as_ptr(),
-                ctx.iovs.as_ptr() as *const c_void,
+                ctx.iovs.as_ptr() as *mut c_void,
                 ctx.iovs.len() as i32,
                 lba,
                 num_blocks as u64,
@@ -1443,7 +1435,55 @@ impl Lbdev {
             )
         };
         if rc != 0 {
-            // f() failed, the callback was not called
+            // spdk_bdev_readv_blocks() failed, the callback was not called
+            // need to drop ctx ref count
+            drop(unsafe { Rc::from_raw(ctx_ptr as *const LbdevIoCtx) });
+
+            result.success.set(false);
+            let fut = unsafe { &mut *result.fut.get() };
+            fut.complete();
+        }
+        result
+    }
+
+    pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
+        let mut iovs_c: Vec<c::iovec> = Vec::new();
+        for iov_slice in io.iter_iov() {
+            let iov_c = c::iovec {
+                iov_base: iov_slice.as_ptr() as *mut _,
+                iov_len: iov_slice.len(),
+            };
+            iovs_c.push(iov_c);
+        }
+
+        let result = Rc::new(LbdevIoResult {
+            fut: UnsafeCell::new(IoFuture::new()),
+            success: Cell::new(false),
+        });
+        let ctx = Rc::new(LbdevIoCtx {
+            iovs: iovs_c,
+            result: result.clone(),
+        });
+
+        // increase ref count for spdk_rwio_complete_cb()
+        let ctx_ptr = Rc::into_raw(ctx.clone()) as *mut _;
+
+        let lba = io.offset_blocks();
+        let num_blocks = io.num_blocks();
+        let rc = unsafe {
+            c::spdk_bdev_writev_blocks(
+                self.desc.raw.as_ptr(),
+                ch.raw.as_ptr(),
+                ctx.iovs.as_ptr() as *mut c_void,
+                ctx.iovs.len() as i32,
+                lba,
+                num_blocks as u64,
+                spdk_rwio_complete_cb,
+                ctx_ptr,
+            )
+        };
+        if rc != 0 {
+            // spdk_bdev_writev_blocks() failed, the callback was not called
             // need to drop ctx ref count
             drop(unsafe { Rc::from_raw(ctx_ptr as *const LbdevIoCtx) });
 
@@ -1467,6 +1507,8 @@ pub struct SpdkBdevOptsC {
     pub blockcnt: u64,
     pub write_cache: bool,
     pub phys_blocklen: u32,
+    pub split_on_write_unit: u32,
+    pub split_on_optimal_io_boundary: u32,
     pub md_interleave: u32,
     pub dif_is_head_of_md: u32,
     pub write_unit_size: u32,
