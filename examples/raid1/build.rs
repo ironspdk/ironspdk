@@ -1,11 +1,12 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::Path;
 
-fn build_c_src(spdk_include: &PathBuf) {
+fn build_c_src(spdk_include_dir: &Path) {
     let mut build = cc::Build::new();
     build
         .file("c_src/raid1.c")
-        .include(spdk_include)
+        .flag("-isystem")
+        .flag(spdk_include_dir.to_str().unwrap())
         .include(ironspdk_sys::include_dir())
         .flag("-std=gnu11")
         .cargo_metadata(false);
