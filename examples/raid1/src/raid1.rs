@@ -22,11 +22,8 @@ struct Raid1IoChannel {
 struct Raid1Bdev {
     name: String,
 
-    /// Strip size, bytes
-    strip_size: usize,
-
-    /// Block length, bytes
-    blocklen: usize,
+    /// Strip size, blocks
+    strip_blocks: usize,
 
     children_names: Vec<String>,
     workers: Vec<SpdkThread>,
@@ -53,6 +50,7 @@ impl Bdev for Raid1Bdev {
     }
 
     fn io_type_supported(&self, io_type: IoType) -> bool {
+        // TODO: support RESET, FLUSH, UNMAP
         matches!(io_type, IoType::Read | IoType::Write | IoType::Flush)
     }
 
@@ -106,12 +104,7 @@ impl Bdev for Raid1Bdev {
 }
 
 impl Raid1Bdev {
-    pub fn new(
-        name: &str,
-        blocklen: usize,
-        strip_size: usize,
-        children_names: Vec<&str>,
-    ) -> Result<Self, Error> {
+    pub fn new(name: &str, strip_blocks: usize, children_names: Vec<&str>) -> Result<Self, Error> {
         let n = SpdkThread::core_count();
         let mut workers = Vec::with_capacity(n as usize);
         for core in 0..n {
@@ -122,16 +115,14 @@ impl Raid1Bdev {
         }
         Ok(Self {
             name: name.to_string(),
-            strip_size,
-            blocklen,
+            strip_blocks,
             children_names: children_names.iter().map(|&s| s.to_string()).collect(),
             workers,
         })
     }
 
     fn owner_thread_idx(&self, off: u64) -> usize {
-        let strip_size_in_blocks = (self.strip_size / self.blocklen) as u64;
-        ((off / strip_size_in_blocks) % (self.workers.len() as u64)) as usize
+        ((off / self.strip_blocks as u64) % (self.workers.len() as u64)) as usize
     }
 
     async fn submit_read(&self, sender_thread: &SpdkThread, ch: &mut Raid1IoChannel, io: BdevIo) {
@@ -262,8 +253,9 @@ fn rpc_rs_raid1_create(args: rpc::RpcCmdArgs) -> rpc::RpcCmdResult {
     let children_names: Vec<&str> = children_names_cs.split(',').collect();
     let (blocklen, num_blocks) = parse_children(&children_names)?;
     let strip_size = parse_strip_size(args.clone(), blocklen)?;
+    let strip_blocks = strip_size / blocklen;
 
-    let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, blocklen, strip_size, children_names)?);
+    let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, strip_blocks, children_names)?);
 
     ironspdk::bdev_registry_add(name.to_string(), bdevh.clone())?;
 
