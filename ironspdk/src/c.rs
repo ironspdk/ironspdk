@@ -182,7 +182,7 @@ unsafe extern "C" {
     pub fn spdk_bdev_readv_blocks(
         desc: *mut spdk_bdev_desc,
         ch: *mut spdk_io_channel,
-        iov: *const c_void,
+        iov: *mut c_void,
         iovcnt: c_int,
         offset_blocks: u64,
         num_blocks: u64,
@@ -193,7 +193,7 @@ unsafe extern "C" {
     pub fn spdk_bdev_writev_blocks(
         desc: *mut spdk_bdev_desc,
         ch: *mut spdk_io_channel,
-        iov: *const c_void,
+        iov: *mut c_void,
         iovcnt: c_int,
         offset_blocks: u64,
         num_blocks: u64,
@@ -224,6 +224,8 @@ unsafe extern "C" {
     pub fn spdk_env_get_core_count() -> u32;
 
     pub fn spdk_dma_malloc(size: usize, align: usize, unused: *mut u64) -> *mut c_void;
+
+    pub fn spdk_dma_zmalloc(size: usize, align: usize, unused: *mut u64) -> *mut c_void;
 
     pub fn spdk_dma_free(buf: *mut c_void);
 }
