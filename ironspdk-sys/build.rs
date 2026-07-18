@@ -1,15 +1,16 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn build_shim(include_dir: &PathBuf) {
+fn build_shim(spdk_include_dir: &Path) {
     let mut build = cc::Build::new();
     build
         .file("c_src/bdev.c")
         .file("c_src/json.c")
         .file("c_src/shim.c")
         .file("c_src/util.c")
-        .include(include_dir)
+        .flag("-isystem")
+        .flag(spdk_include_dir.to_str().unwrap())
         .flag("-std=gnu11")
         .cargo_metadata(false);
 
