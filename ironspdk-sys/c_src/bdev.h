@@ -9,6 +9,17 @@ struct SpdkBdevOptsC {
     uint64_t blockcnt;
     bool write_cache;
     uint32_t phys_blocklen;
+    uint32_t split_on_write_unit;
+    uint32_t split_on_optimal_io_boundary;
+    uint32_t md_interleave;
+    uint32_t dif_is_head_of_md;
+    uint32_t write_unit_size;
+    uint32_t optimal_io_boundary;
+    uint32_t preferred_write_alignment;
+    uint32_t preferred_write_granularity;
+    uint32_t optimal_write_size;
+    uint32_t preferred_unmap_alignment;
+    uint32_t preferred_unmap_granularity;
 };
 
 int u_bdev_destruct(void *ctx);

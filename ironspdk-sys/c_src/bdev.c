@@ -105,6 +105,17 @@ struct spdk_bdev *u_bdev_alloc(const char *name,
     OPT(blockcnt);
     OPT(write_cache);
     OPT(phys_blocklen);
+    OPT(split_on_write_unit);
+    OPT(split_on_optimal_io_boundary);
+    OPT(md_interleave);
+    OPT(dif_is_head_of_md);
+    OPT(write_unit_size);
+    OPT(optimal_io_boundary);
+    OPT(preferred_write_alignment);
+    OPT(preferred_write_granularity);
+    OPT(optimal_write_size);
+    OPT(preferred_unmap_alignment);
+    OPT(preferred_unmap_granularity);
     #undef OPT
 
     return bdev;
