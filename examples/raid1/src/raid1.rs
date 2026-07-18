@@ -4,48 +4,14 @@ use ironspdk::define_bdev_opts;
 use ironspdk::rpc;
 use ironspdk::rpc_register;
 use ironspdk::{
-    Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, Io, IoFuture, IoStatus, IoType, Lbdev,
-    LbdevIoChannel, RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, Tcb, thread_id,
+    Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, Io, IoStatus, IoType, Lbdev, LbdevIoChannel,
+    RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, Tcb, thread_id,
 };
 use log::{debug, error};
 use paste::paste;
-use std::cell::{Cell, UnsafeCell};
 use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
-
-struct RaidIoResult {
-    remain: Cell<usize>,
-    success: Cell<bool>,
-    fut: UnsafeCell<IoFuture>,
-}
-
-impl RaidIoResult {
-    fn new(n: usize) -> Rc<Self> {
-        Rc::new(Self {
-            remain: Cell::new(n),
-            success: Cell::new(true),
-            fut: UnsafeCell::new(IoFuture::new()),
-        })
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    fn future(&self) -> &mut IoFuture {
-        unsafe { &mut *self.fut.get() }
-    }
-
-    fn child_done(&self, ok: bool) {
-        if !ok {
-            self.success.set(false);
-        }
-        debug_assert!(self.remain.get() != 0);
-        let remain = self.remain.get() - 1;
-        self.remain.set(remain);
-        if remain == 0 {
-            self.future().complete();
-        }
-    }
-}
 
 struct Raid1IoChannel {
     children: Vec<Rc<Lbdev>>,
@@ -205,26 +171,19 @@ impl Raid1Bdev {
         debug_assert!(!ch.children.is_empty());
         debug_assert!(ch.chans.len() == ch.children.len());
 
-        let res = RaidIoResult::new(ch.children.len());
-
         let mut crs = Vec::new();
         for (idx, child) in ch.children.iter().enumerate() {
             let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
             let child_res = child.write(&ch.chans[idx], ioref);
             crs.push(child_res);
         }
+        let mut status = IoStatus::Success;
         for child_res in crs {
             child_res.future().await;
-            res.child_done(child_res.success());
+            if !child_res.success() {
+                status = IoStatus::Failure;
+            }
         }
-
-        res.future().await;
-
-        let status = if res.success.get() {
-            IoStatus::Success
-        } else {
-            IoStatus::Failure
-        };
         io.complete_on(sender_thread, status);
     }
 }
