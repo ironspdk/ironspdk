@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice::{Iter, IterMut, from_raw_parts, from_raw_parts_mut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use thiserror::Error;
@@ -34,6 +35,10 @@ pub mod rpc;
 
 static BDEV_REGISTRY: OnceLock<Mutex<HashMap<String, BdevHandle>>> = OnceLock::new();
 static TCB_REGISTRY: OnceLock<RwLock<HashMap<ThreadKey, TcbPtr>>> = OnceLock::new();
+
+std::thread_local! {
+    static CURRENT_TCB: Cell<*const Tcb> = const { Cell::new(std::ptr::null()) };
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1024,45 +1029,206 @@ impl SpdkThread {
     }
 }
 
+pub const TLS_SLOTS: usize = 8;
+
+/// Type-safe slot for TLS
+pub struct TlsSlot<T: 'static> {
+    index: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+unsafe impl<T: 'static> Send for TlsSlot<T> {}
+unsafe impl<T: 'static> Sync for TlsSlot<T> {}
+
+impl<T: 'static> Clone for TlsSlot<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static> Copy for TlsSlot<T> {}
+
+impl<T: 'static> TlsSlot<T> {
+    /// Const constructor for `static` declarations.
+    /// The caller picks the index explicitly.
+    pub const fn new(index: usize) -> Self {
+        assert!(index < TLS_SLOTS, "TLS slot index out of bounds");
+        Self {
+            index,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Dynamic allocator for non-static use
+    pub fn alloc() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let index = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(index < TLS_SLOTS, "out of TLS slots");
+        Self {
+            index,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Thread-local storage for SPDK threads.
+/// No heap, no atomics, no locks, no reallocs
+pub struct Tls {
+    slots: [UnsafeCell<*mut c_void>; TLS_SLOTS],
+    drop_fns: [UnsafeCell<Option<DropFn>>; TLS_SLOTS],
+}
+
+type DropFn = unsafe fn(*mut c_void);
+
+// SAFETY: tls is only accessed by SPDK thread that owns the TCB
+unsafe impl Send for Tls {}
+unsafe impl Sync for Tls {}
+
+unsafe fn drop_box<T>(p: *mut c_void) {
+    drop(unsafe { Box::from_raw(p as *mut T) });
+}
+
+impl Default for Tls {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tls {
+    pub fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| UnsafeCell::new(std::ptr::null_mut())),
+            drop_fns: std::array::from_fn(|_| UnsafeCell::new(None)),
+        }
+    }
+
+    #[inline]
+    pub fn set<T: 'static>(&self, slot: &TlsSlot<T>, value: T) {
+        self.clear_slot(slot.index);
+        let ptr = Box::into_raw(Box::new(value));
+        unsafe {
+            *self.slots[slot.index].get() = ptr as *mut c_void;
+            *self.drop_fns[slot.index].get() = Some(drop_box::<T>);
+        }
+    }
+
+    #[inline]
+    pub fn get<T: 'static>(&self, slot: &TlsSlot<T>) -> Option<&T> {
+        let ptr = unsafe { *self.slots[slot.index].get() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*(ptr as *const T) })
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut<T: 'static>(&self, slot: &TlsSlot<T>) -> Option<&mut T> {
+        let ptr = unsafe { *self.slots[slot.index].get() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *(ptr as *mut T) })
+        }
+    }
+
+    pub fn clear_all(&self) {
+        for i in 0..TLS_SLOTS {
+            self.clear_slot(i);
+        }
+    }
+
+    #[inline]
+    fn clear_slot(&self, index: usize) {
+        let ptr = unsafe { *self.slots[index].get() };
+        if !ptr.is_null() {
+            if let Some(drop_fn) = unsafe { *self.drop_fns[index].get() } {
+                unsafe { drop_fn(ptr) };
+            }
+            unsafe {
+                *self.slots[index].get() = std::ptr::null_mut();
+                *self.drop_fns[index].get() = None;
+            }
+        }
+    }
+}
+
+std::thread_local! {
+    // 0 means “no cache”. SPDK thread IDs start at 1.
+    static CACHED_THREAD_ID: Cell<u64> = const { Cell::new(0) };
+    static CACHED_TCB: Cell<*const Tcb> = const { Cell::new(std::ptr::null()) };
+}
+
 /// Rust thread control block (per SPDK thread)
 /// It contains
 ///     - executor tied with SPDK poller
-///     - storage for I/O channels owned by this SPDK thread
+///     - thread-local storage
 pub struct Tcb {
     runq: RefCell<VecDeque<Rc<Task>>>,
     poller: Cell<*mut c::spdk_poller>,
-    io_channels: RefCell<HashMap<BdevId, RefCell<RcBdevIoChannel>>>,
+    pub tls: Tls,
 }
 
 impl Tcb {
+    /// Get current TCB
+    /// Hot path: 2 loads + 1 u64 compare + 1 branch
+    /// Slow path: one RwLock read, executed on SPDK thread cross-reactor migration
+    #[inline]
     pub fn current() -> &'static Self {
         let thread = unsafe { c::spdk_get_thread() };
-        assert!(!thread.is_null(), "Not on SPDK thread");
+        assert!(
+            !thread.is_null(),
+            "Tcb::current() called outside of SPDK thread"
+        );
 
-        let thread_key = ThreadKey::from_thread(thread);
+        let current_id = unsafe { c::spdk_thread_get_id(thread) };
+        let cached_id = CACHED_THREAD_ID.with(|c| c.get());
+        if cached_id == current_id {
+            let ptr = CACHED_TCB.with(|c| c.get());
+            // SAFETY: SPDK thread IDs are unique and monotonic.
+            // Equity means thread has not changed and CACHED_TCB points to
+            // real TCB
+            unsafe { &*ptr }
+        } else {
+            Self::current_slow(thread, current_id)
+        }
+    }
 
-        // fast path (lock for read)
+    #[cold]
+    fn tcb_ptr_from_registry(thread_key: ThreadKey) -> *const Tcb {
+        // fast path: try read existing value
         {
             let map = tcb_registry().read();
             if let Some(&tcb_ptr) = map.get(&thread_key) {
                 return unsafe { &*(tcb_ptr.ptr() as *const Tcb) };
             }
         }
-
-        // slow path (lock for write)
+        // slow path: read-or-create value
         let mut map = tcb_registry().write();
         let tcb_ptr = map.entry(thread_key).or_insert_with(|| {
             let tcb = Tcb::new();
             TcbPtr::from_tcb(tcb)
         });
-        unsafe { &*(tcb_ptr.ptr() as *const Tcb) }
+        tcb_ptr.ptr() as *const Tcb
+    }
+
+    #[cold]
+    fn current_slow(thread: *mut c::spdk_thread, thread_id: u64) -> &'static Self {
+        let thread_key = ThreadKey::from_thread(thread);
+        let tcb_ptr = Self::tcb_ptr_from_registry(thread_key);
+
+        CACHED_THREAD_ID.with(|c| c.set(thread_id));
+        CACHED_TCB.with(|c| c.set(tcb_ptr));
+
+        unsafe { &*tcb_ptr }
     }
 
     fn new() -> *mut Tcb {
         let tcb = Box::new(Tcb {
             runq: RefCell::new(VecDeque::new()),
             poller: Cell::new(std::ptr::null_mut()),
-            io_channels: RefCell::new(HashMap::new()),
+            tls: Tls::new(),
         });
 
         let tcb_ptr = Box::into_raw(tcb);
@@ -1108,36 +1274,29 @@ impl Tcb {
     }
 
     fn shutdown(&self) {
-        let mut map = tcb_registry().write();
         let thread = unsafe { c::spdk_get_thread() };
         assert!(!thread.is_null(), "Not on SPDK thread");
 
-        // Remove association between thread and TCB
-        let thread_key = ThreadKey::from_thread(thread);
-        let _ = map.remove(&thread_key).unwrap();
+        // Call drop() on TLS slots. Write lock must not be taken yet
+        self.tls.clear_all();
 
-        // Drain and drop io channels
-        self.io_channels.borrow_mut().clear();
-
-        // Drain run queue and drop tasks
+        // Drain run queue
         self.runq.borrow_mut().clear();
 
         unsafe {
             c::spdk_poller_unregister(&mut (self.poller.get() as *mut _));
         }
-    }
 
-    pub fn set_io_channel(&self, rawbdev: RawBdevHandle, ch: RcBdevIoChannel) {
-        self.io_channels
-            .borrow_mut()
-            .insert(BdevId(rawbdev.as_ptr() as usize), RefCell::new(ch));
+        // Remove from TCB_REGISTRY
+        let mut map = tcb_registry().write();
+        let thread_key = ThreadKey::from_thread(thread);
+        let _ = map.remove(&thread_key).expect("TCB not found in registry");
     }
+}
 
-    pub fn io_channel(&self, io: &BdevIo) -> Option<RcBdevIoChannel> {
-        self.io_channels
-            .borrow()
-            .get(&io.bdev_id())
-            .map(|ch| ch.borrow().clone())
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        self.tls.clear_all();
     }
 }
 
