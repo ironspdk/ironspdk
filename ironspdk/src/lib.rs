@@ -1029,32 +1029,57 @@ impl SpdkThread {
     }
 }
 
-pub const TLS_SLOTS: usize = 8;
+pub const TLS_SLOTS: usize = 4;
 
-/// Type-safe slot for TLS
-pub struct TlsSlot<T: 'static> {
-    index: usize,
+///
+/// SPDK TLS interface
+///
+/// It introduces SPDK TLS (which is not present in native SPDK)
+/// ironspdk library user can store/load values at several TLS keys
+/// (maximum count of keys is TLS_SLOTS). SPDK TLS values are visible
+/// to current SPDK thread only and live while it lives.
+/// SPDK TLS is cheap: takes one cache line of memory and
+/// O(1) of time at loading/storing.
+///
+/// SAFETY: The code of TlsKey::new() and TlsKey::alloc() panics if key slot
+/// count exceeds TLS_SLOTS. This in intentional: SPDK TLS is a limited resource
+/// and should not be wasted.
+///
+/// Usage example:
+///    let my_type_tls = TlsKey<MyType>::alloc(); // allocate the key at free slot
+///    my_type_tls.set(MyType {...});
+///    let val = my_type_tls.get()?;
+///
+/// or
+///
+///    static MY_TYPE_TLS = TlsKey<MyType>::new(0); // explicitly take a slot with index 0
+///    ...
+///    MY_TYPE_TLS.set(MyType {...});
+///    let val = MY_TYPE_TLS.get()?;
+///
+pub struct TlsKey<T: 'static> {
+    slot: usize,
     _marker: PhantomData<fn() -> T>,
 }
 
-unsafe impl<T: 'static> Send for TlsSlot<T> {}
-unsafe impl<T: 'static> Sync for TlsSlot<T> {}
+unsafe impl<T: 'static> Send for TlsKey<T> {}
+unsafe impl<T: 'static> Sync for TlsKey<T> {}
 
-impl<T: 'static> Clone for TlsSlot<T> {
+impl<T: 'static> Clone for TlsKey<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: 'static> Copy for TlsSlot<T> {}
+impl<T: 'static> Copy for TlsKey<T> {}
 
-impl<T: 'static> TlsSlot<T> {
+impl<T: 'static> TlsKey<T> {
     /// Const constructor for `static` declarations.
     /// The caller picks the index explicitly.
-    pub const fn new(index: usize) -> Self {
-        assert!(index < TLS_SLOTS, "TLS slot index out of bounds");
+    pub const fn new(slot: usize) -> Self {
+        assert!(slot < TLS_SLOTS, "TLS slot index out of bounds");
         Self {
-            index,
+            slot,
             _marker: PhantomData,
         }
     }
@@ -1062,25 +1087,45 @@ impl<T: 'static> TlsSlot<T> {
     /// Dynamic allocator for non-static use
     pub fn alloc() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let index = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert!(index < TLS_SLOTS, "out of TLS slots");
+        let slot = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(slot < TLS_SLOTS, "out of TLS slots");
         Self {
-            index,
+            slot,
             _marker: PhantomData,
         }
     }
+
+    #[inline]
+    pub fn set(&self, value: T) {
+        Tcb::current().tls.set(self, value);
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        Tcb::current().tls.get(self)
+    }
+
+    #[inline]
+    pub fn get_mut(&self) -> Option<&mut T> {
+        Tcb::current().tls.get_mut(self)
+    }
+
+    pub fn clear(&self) {
+        Tcb::current().tls.clear_slot(self.slot);
+    }
 }
 
-/// Thread-local storage for SPDK threads.
-/// No heap, no atomics, no locks, no reallocs
-pub struct Tls {
+// SPDK TLS representation.
+// No heap, no atomics, no locks, no reallocs
+#[repr(align(64))]
+struct Tls {
     slots: [UnsafeCell<*mut c_void>; TLS_SLOTS],
     drop_fns: [UnsafeCell<Option<DropFn>>; TLS_SLOTS],
 }
 
 type DropFn = unsafe fn(*mut c_void);
 
-// SAFETY: tls is only accessed by SPDK thread that owns the TCB
+// SAFETY: TLS is only accessed by SPDK thread that owns the TCB
 unsafe impl Send for Tls {}
 unsafe impl Sync for Tls {}
 
@@ -1095,7 +1140,7 @@ impl Default for Tls {
 }
 
 impl Tls {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| UnsafeCell::new(std::ptr::null_mut())),
             drop_fns: std::array::from_fn(|_| UnsafeCell::new(None)),
@@ -1103,18 +1148,18 @@ impl Tls {
     }
 
     #[inline]
-    pub fn set<T: 'static>(&self, slot: &TlsSlot<T>, value: T) {
-        self.clear_slot(slot.index);
+    fn set<T: 'static>(&self, key: &TlsKey<T>, value: T) {
+        self.clear_slot(key.slot);
         let ptr = Box::into_raw(Box::new(value));
         unsafe {
-            *self.slots[slot.index].get() = ptr as *mut c_void;
-            *self.drop_fns[slot.index].get() = Some(drop_box::<T>);
+            *self.slots[key.slot].get() = ptr as *mut c_void;
+            *self.drop_fns[key.slot].get() = Some(drop_box::<T>);
         }
     }
 
     #[inline]
-    pub fn get<T: 'static>(&self, slot: &TlsSlot<T>) -> Option<&T> {
-        let ptr = unsafe { *self.slots[slot.index].get() };
+    fn get<T: 'static>(&self, key: &TlsKey<T>) -> Option<&T> {
+        let ptr = unsafe { *self.slots[key.slot].get() };
         if ptr.is_null() {
             None
         } else {
@@ -1124,8 +1169,8 @@ impl Tls {
 
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    pub fn get_mut<T: 'static>(&self, slot: &TlsSlot<T>) -> Option<&mut T> {
-        let ptr = unsafe { *self.slots[slot.index].get() };
+    fn get_mut<T: 'static>(&self, key: &TlsKey<T>) -> Option<&mut T> {
+        let ptr = unsafe { *self.slots[key.slot].get() };
         if ptr.is_null() {
             None
         } else {
@@ -1133,7 +1178,7 @@ impl Tls {
         }
     }
 
-    pub fn clear_all(&self) {
+    fn clear_all(&self) {
         for i in 0..TLS_SLOTS {
             self.clear_slot(i);
         }
@@ -1154,28 +1199,35 @@ impl Tls {
     }
 }
 
+//
+// Use local TLS to access TCB in O(1) time.
+// Store spdk_thread ID (which is unique and increases on creation of
+// new spdk_thread-s) and TCB.
+// This facilitates survival if and when SPDK migrates spdk_thread to other reactor
+//
 std::thread_local! {
-    // 0 means “no cache”. SPDK thread IDs start at 1.
+    // 0 means “no cache”. spdk_thread IDs start at 1.
     static CACHED_THREAD_ID: Cell<u64> = const { Cell::new(0) };
     static CACHED_TCB: Cell<*const Tcb> = const { Cell::new(std::ptr::null()) };
 }
 
-/// Rust thread control block (per SPDK thread)
-/// It contains
-///     - executor tied with SPDK poller
-///     - thread-local storage
-pub struct Tcb {
+// Thread Control Block (per SPDK thread)
+// It stores
+//     - executor tied with SPDK poller
+//     - thread-local storage
+// This interface is internal for ironspdk runtime.
+struct Tcb {
     runq: RefCell<VecDeque<Rc<Task>>>,
     poller: Cell<*mut c::spdk_poller>,
-    pub tls: Tls,
+    tls: Tls,
 }
 
 impl Tcb {
-    /// Get current TCB
-    /// Hot path: 2 loads + 1 u64 compare + 1 branch
-    /// Slow path: one RwLock read, executed on SPDK thread cross-reactor migration
+    // Get current TCB
+    // Hot path: 2 loads + 1 u64 compare + 1 branch
+    // Slow path: one RwLock read, executed on SPDK thread cross-reactor migration
     #[inline]
-    pub fn current() -> &'static Self {
+    fn current() -> &'static Self {
         let thread = unsafe { c::spdk_get_thread() };
         assert!(
             !thread.is_null(),
