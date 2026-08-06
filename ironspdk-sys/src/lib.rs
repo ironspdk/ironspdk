@@ -44,7 +44,7 @@ fn parse_pkgcfg_tokens(tokens: Vec<String>) {
         if let Some(lib_path) = tok.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={}", lib_path);
         } else if tok.starts_with("-l") || tok.ends_with(".a") {
-            println!("cargo:rustc-link-arg={}", &tok);
+            println!("cargo:rustc-link-arg={}", tok);
         } else if let Some(inc_path) = tok.strip_prefix("-I") {
             println!("cargo:include={}", inc_path);
         }
@@ -98,7 +98,7 @@ pub fn emit_preamble() {
     println!("cargo:rustc-link-arg=-Wl,-Bstatic");
     println!("cargo:rustc-link-arg=-Wl,--whole-archive");
     let out_dir = ironspdk_sys_out_dir();
-    println!("cargo:rustc-link-search=native={}", &out_dir);
+    println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-arg=-lironspdkshim");
 }
 
