@@ -16,7 +16,7 @@ fn build_c_src(spdk_include_dir: &Path) {
         .expect("Failed to compile C source code");
 
     let out_dir = env::var("OUT_DIR").unwrap();
-    println!("cargo:rustc-link-search=native={}", &out_dir);
+    println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-arg=-lcsrc");
 }
 
