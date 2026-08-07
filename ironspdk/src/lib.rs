@@ -649,6 +649,67 @@ impl BdevIoChannel {
     }
 }
 
+///
+/// Lightweight wrapper of 'struct spdk_io_channel'.
+/// Borrows existing SPDK channel.
+/// Constructed by ironspdk linbrary and passed to Bdev.submit_io()
+///
+/// # SAFETY
+/// The handle may only be used on the SPDK thread that owns the channel.
+/// Use [`RcBdevIoChannel`] when a channel must be retained by a custom
+/// SPDK thread.
+///
+/// Usage:
+///    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
+///        ...
+///        let submit_thread = SpdkThread::current();
+///        submit_thread.spawn(async move {
+///            let ch = ch.downcast_mut::<MyIoChannel>();
+///            ...
+///        });
+///        ...
+///    }
+///
+#[derive(Clone, Copy)]
+pub struct BdevIoChannelRef {
+    raw: NonNull<c::spdk_io_channel>,
+}
+
+impl std::fmt::Debug for BdevIoChannelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BdevIoChannelRef(raw: {:p})", self.raw.as_ptr())
+    }
+}
+
+impl BdevIoChannelRef {
+    /// Creates a borrowed reference to an existing SPDK I/O channel.
+    ///
+    /// # SAFETY
+    /// `raw` must be a valid `spdk_io_channel` belonging to the current
+    /// SPDK thread. The returned value does not acquire a reference to the
+    /// channel and must not outlive the channel.
+    pub(crate) unsafe fn from_raw(raw: *mut c::spdk_io_channel) -> Self {
+        Self {
+            raw: NonNull::new(raw).expect("SPDK io channel null pointer"),
+        }
+    }
+
+    /// Returns mutable access to the Rust channel context.
+    ///
+    /// # SAFETY invariant
+    /// SPDK invokes a bdev's submit_request callback serially for a given
+    /// SPDK thread, and the channel belongs exclusively to that thread.
+    /// Therefore the returned mutable reference will not be used concurrently.
+    #[allow(clippy::mut_from_ref)]
+    pub fn downcast_mut<T: Any>(&self) -> &mut T {
+        let spdk_ch_ctx = unsafe { c::u_spdk_io_channel_get_ctx(self.raw.as_ptr()) };
+        let io_ch_ctx = unsafe { c::u_io_channel_get_rust_ctx(spdk_ch_ctx) };
+        debug_assert!(!io_ch_ctx.is_null());
+        let ch = unsafe { &mut *(io_ch_ctx as *mut BdevIoChannel) };
+        ch.downcast_mut::<T>()
+    }
+}
+
 /// Reference-counted bdev I/O channel wrapper.
 /// It uses (struct spdk_io_channel).ref as a non-atomic reference counter.
 /// It should be used by custom SPDK threads (created manually
@@ -660,7 +721,12 @@ pub struct RcBdevIoChannel {
 impl std::fmt::Debug for RcBdevIoChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let refcnt = unsafe { c::spdk_io_channel_get_ref_count(self.raw.as_ptr()) };
-        write!(f, "RcBdevIoChannel(raw: {:p}, ref: {})", self.raw, refcnt)
+        write!(
+            f,
+            "RcBdevIoChannel(raw: {:p}, ref: {})",
+            self.raw.as_ptr(),
+            refcnt
+        )
     }
 }
 
@@ -706,7 +772,7 @@ pub trait Bdev {
 
     fn create_io_channel(&self) -> Box<BdevIoChannel>;
 
-    fn submit_io(&self, ch: &mut BdevIoChannel, io: BdevIo);
+    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo);
 }
 
 /// Handle for passing Bdev-s to C FFI
@@ -838,16 +904,17 @@ extern "C" fn rsu_bdev_init(bdev_ctxt: *mut c_void) {
 #[unsafe(no_mangle)]
 extern "C" fn rsu_bdev_submit_request(
     bdev_ctxt: *mut c_void,
-    io_ch_ctxt: *mut c_void,
+    ch: *mut c::spdk_io_channel,
     io: *mut c::spdk_bdev_io,
 ) {
     debug_assert!(!bdev_ctxt.is_null());
-    debug_assert!(!io_ch_ctxt.is_null());
+    debug_assert!(!ch.is_null());
 
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
 
     let io = BdevIo::new(io);
-    let ch: &mut BdevIoChannel = unsafe { &mut *(io_ch_ctxt as *mut BdevIoChannel) };
+
+    let ch = unsafe { BdevIoChannelRef::from_raw(ch) };
 
     ctx.bdev.submit_io(ch, io);
 }
