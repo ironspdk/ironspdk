@@ -17,4 +17,5 @@ bool rsu_bdev_io_type_supported(void *ctxt, enum spdk_bdev_io_type io_type);
 
 void rsu_bdev_init(void *bdev_ctxt);
 
-void rsu_bdev_submit_request(void *bdev_ctxt, void *io_ch_ctxt, struct spdk_bdev_io *io);
+void rsu_bdev_submit_request(void *bdev_ctxt, struct spdk_io_channel *ch,
+                             struct spdk_bdev_io *io);

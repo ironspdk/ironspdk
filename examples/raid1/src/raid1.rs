@@ -4,8 +4,9 @@ use ironspdk::define_bdev_opts;
 use ironspdk::rpc;
 use ironspdk::rpc_register;
 use ironspdk::{
-    Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, Io, IoStatus, IoType, Lbdev, LbdevIoChannel,
-    RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, TlsKey, thread_id,
+    Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, BdevIoChannelRef, Io, IoStatus, IoType,
+    Lbdev, LbdevIoChannel, RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, TlsKey,
+    thread_id,
 };
 use log::{debug, error};
 use paste::paste;
@@ -79,7 +80,7 @@ impl Bdev for Raid1Bdev {
         }))
     }
 
-    fn submit_io(&self, _ch: &mut BdevIoChannel, io: BdevIo) {
+    fn submit_io(&self, _ch: BdevIoChannelRef, io: BdevIo) {
         let idx = self.owner_thread_idx(io.offset_blocks());
         let owner_thread = self.workers[idx].clone();
         let sender_thread = SpdkThread::current();

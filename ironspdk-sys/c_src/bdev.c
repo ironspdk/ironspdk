@@ -61,10 +61,8 @@ void u_bdev_submit_request(struct spdk_io_channel *ch,
                            struct spdk_bdev_io *bdev_io)
 {
     void *bdev_ctxt = bdev_io->bdev->ctxt;
-    void *io_ch_ctxt = spdk_io_channel_get_ctx(ch);
-    struct io_channel_ctx *chctx = io_ch_ctxt;
 
-    rsu_bdev_submit_request(bdev_ctxt, chctx->rust_ch, bdev_io);
+    rsu_bdev_submit_request(bdev_ctxt, ch, bdev_io);
 }
 
 bool u_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
