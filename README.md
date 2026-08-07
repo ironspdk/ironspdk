@@ -1,5 +1,8 @@
 # ironspdk
 
+[![CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)
+![License](https://img.shields.io/crates/l/ironspdk?style=flat-square)
+
 Rust runtime for SPDK. Write high-performance usermode storage drivers in Rust.
 
 A cutting-edge Rust runtime that brings the power of modern async/await to SPDK (Storage Performance Development Kit). Build block devices and storage modules with the safety and productivity of Rust, while maintaining C-level performance.
