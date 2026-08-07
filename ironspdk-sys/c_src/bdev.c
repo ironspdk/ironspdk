@@ -123,17 +123,13 @@ struct spdk_bdev *u_bdev_alloc(const char *name,
 
 int u_bdev_register(const char *name, struct spdk_bdev *bdev)
 {
-    int rc;
-
     spdk_io_device_register(bdev,
                             u_bdev_io_channel_create,
                             u_bdev_io_channel_destroy,
                             sizeof(struct io_channel_ctx),
                             name);
-    rc = spdk_bdev_register(bdev);
-    if (rc == 0)
-        rsu_bdev_init(bdev->ctxt);
-    return rc;
+    rsu_bdev_init(bdev->ctxt);
+    return spdk_bdev_register(bdev);
 }
 
 static void

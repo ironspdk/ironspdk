@@ -700,7 +700,7 @@ impl RcBdevIoChannel {
 /// Rust Bdev trait. If you write ironspdk Rust bdev module,
 /// you should implement this trait.
 pub trait Bdev {
-    fn init(&self, ctx: RawBdevHandle);
+    fn init(&self, rawbdev: RawBdevHandle);
 
     fn io_type_supported(&self, io_type: IoType) -> bool;
 
@@ -831,8 +831,8 @@ extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: i32)
 #[unsafe(no_mangle)]
 extern "C" fn rsu_bdev_init(bdev_ctxt: *mut c_void) {
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
-    ctx.bdev
-        .init(NonNull::new(ctx.spdk_bdev).expect("bdev pointer must not be NULL"));
+    let rawbdev = NonNull::new(ctx.spdk_bdev).expect("bdev pointer must not be NULL");
+    ctx.bdev.init(rawbdev);
 }
 
 #[unsafe(no_mangle)]
@@ -849,9 +849,7 @@ extern "C" fn rsu_bdev_submit_request(
     let io = BdevIo::new(io);
     let ch: &mut BdevIoChannel = unsafe { &mut *(io_ch_ctxt as *mut BdevIoChannel) };
 
-    SpdkThread::current().spawn(async move {
-        ctx.bdev.submit_io(ch, io);
-    });
+    ctx.bdev.submit_io(ch, io);
 }
 
 // SPDK poller trampoline
