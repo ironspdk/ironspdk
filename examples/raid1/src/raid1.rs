@@ -5,16 +5,13 @@ use ironspdk::rpc;
 use ironspdk::rpc_register;
 use ironspdk::{
     Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, BdevIoChannelRef, Io, IoStatus, IoType,
-    Lbdev, LbdevIoChannel, RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, TlsKey,
-    thread_id,
+    Lbdev, LbdevIoChannel, RawBdevHandle, SpdkBdevOptsC, SpdkThread, thread_id,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use paste::paste;
 use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
-
-static IOCH_TLS: TlsKey<RcBdevIoChannel> = TlsKey::new(0);
 
 struct Raid1IoChannel {
     children: Vec<Rc<Lbdev>>,
@@ -24,33 +21,17 @@ struct Raid1IoChannel {
 
 struct Raid1Bdev {
     name: String,
-
-    /// Strip size, blocks
-    strip_blocks: usize,
-
     children_names: Vec<String>,
-    workers: Vec<SpdkThread>,
 }
 
 impl Drop for Raid1Bdev {
     fn drop(&mut self) {
-        // Need to stop all workers. This is mandatory.
-        for w in &self.workers {
-            w.request_exit();
-        }
         debug!("DROP Raid1Bdev #{} name='{}'", thread_id(), self.name);
     }
 }
 
 impl Bdev for Raid1Bdev {
-    fn init(&self, rawbdev: RawBdevHandle) {
-        for w in &self.workers {
-            w.spawn(async move {
-                let refch = RcBdevIoChannel::new(rawbdev);
-                IOCH_TLS.set(refch);
-            });
-        }
-    }
+    fn init(&self, _rawbdev: RawBdevHandle) {}
 
     fn io_type_supported(&self, io_type: IoType) -> bool {
         // TODO: support RESET, FLUSH, UNMAP
@@ -80,24 +61,23 @@ impl Bdev for Raid1Bdev {
         }))
     }
 
-    fn submit_io(&self, _ch: BdevIoChannelRef, io: BdevIo) {
-        let idx = self.owner_thread_idx(io.offset_blocks());
-        let owner_thread = self.workers[idx].clone();
-        let sender_thread = SpdkThread::current();
-        let self_ptr = self as *const Raid1Bdev;
-        owner_thread.spawn(async move {
-            let self1 = unsafe { &*self_ptr };
-            let refch = IOCH_TLS.get().expect("I/O channel not found");
-            let ch = refch.downcast_mut::<Raid1IoChannel>();
+    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
+        let this_ptr = self as *const Raid1Bdev;
+        let current = SpdkThread::current();
+        current.spawn(async move {
+            let this = unsafe { &*this_ptr };
+            let ch = ch.downcast_mut::<Raid1IoChannel>();
+            debug_assert!(!ch.children.is_empty());
+            debug_assert!(ch.chans.len() == ch.children.len());
             match io.io_type() {
-                IoType::Read => self1.submit_read(&sender_thread, ch, io).await,
-                IoType::Write => self1.submit_write(&sender_thread, ch, io).await,
+                IoType::Read => this.read(ch, io).await,
+                IoType::Write => this.write(ch, io).await,
                 IoType::Flush => {
                     // flush==noop for now. TODO implement flush
-                    io.complete_on(&sender_thread, IoStatus::Success);
+                    io.complete(IoStatus::Success);
                 }
                 _ => {
-                    io.complete_on(&sender_thread, IoStatus::Failure);
+                    io.complete(IoStatus::Failure);
                 }
             }
         });
@@ -105,32 +85,15 @@ impl Bdev for Raid1Bdev {
 }
 
 impl Raid1Bdev {
-    pub fn new(name: &str, strip_blocks: usize, children_names: Vec<&str>) -> Result<Self, Error> {
-        let n = SpdkThread::core_count();
-        let mut workers = Vec::with_capacity(n as usize);
-        for core in 0..n {
-            workers.push(SpdkThread::new_at_cores(
-                format!("{}_worker_{}", name, core).as_str(),
-                [core],
-            ));
-        }
+    pub fn new(name: &str, children_names: Vec<&str>) -> Result<Self, Error> {
         Ok(Self {
             name: name.to_string(),
-            strip_blocks,
             children_names: children_names.iter().map(|&s| s.to_string()).collect(),
-            workers,
         })
     }
 
-    fn owner_thread_idx(&self, off: u64) -> usize {
-        ((off / self.strip_blocks as u64) % (self.workers.len() as u64)) as usize
-    }
-
-    async fn submit_read(&self, sender_thread: &SpdkThread, ch: &mut Raid1IoChannel, io: BdevIo) {
-        debug_assert!(!ch.children.is_empty());
-
+    async fn read(&self, ch: &mut Raid1IoChannel, io: BdevIo) {
         let n = ch.children.len();
-        debug_assert!(ch.chans.len() == n);
 
         let mut status = IoStatus::Failure;
 
@@ -153,35 +116,42 @@ impl Raid1Bdev {
         }
 
         if status == IoStatus::Failure {
-            error!("Read error (all children failed) #{} {:?}", thread_id(), io);
+            error!("Read error (all disks failed) #{} {:?}", thread_id(), io);
         }
 
-        io.complete_on(sender_thread, status);
+        io.complete(status);
     }
 
-    async fn submit_write(&self, sender_thread: &SpdkThread, ch: &mut Raid1IoChannel, io: BdevIo) {
-        debug_assert!(!ch.children.is_empty());
-        debug_assert!(ch.chans.len() == ch.children.len());
-
+    async fn write(&self, ch: &mut Raid1IoChannel, io: BdevIo) {
         let mut crs = Vec::new();
         for (idx, child) in ch.children.iter().enumerate() {
             let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
             let child_res = child.write(&ch.chans[idx], ioref);
             crs.push(child_res);
         }
-        let mut status = IoStatus::Success;
-        for child_res in crs {
+        let mut status = IoStatus::Failure;
+        let mut failures = Vec::new();
+        // Wait until all lower bdevs are done, check results
+        for (idx, child_res) in crs.iter().enumerate() {
             child_res.future().await;
-            if !child_res.success() {
-                status = IoStatus::Failure;
+
+            // At least one lower bdev writes successfully. Overall result is SUCCESS
+            if child_res.success() {
+                status = IoStatus::Success;
+            } else {
+                failures.push(idx);
             }
         }
-        io.complete_on(sender_thread, status);
+        if failures.len() != 0 {
+            if status == IoStatus::Failure {
+                error!("Write error (all disks failed) #{} {:?}", thread_id(), io);
+            } else {
+                warn!("Partial write #{} {:?} {:?}", thread_id(), failures, io);
+            }
+        }
+        io.complete(status);
     }
 }
-
-/// Default strip size (if not specified in arguments), bytes
-const DEFAULT_STRIP_SIZE: usize = 128 * 1024;
 
 define_bdev_opts!(Raid1BdevOpts {
     blocklen: u32 = 512,                    // default: 512 bytes
@@ -195,23 +165,6 @@ unsafe extern "C" {
         opts: *const SpdkBdevOptsC,
         rscx: *const c_void,
     ) -> i32;
-}
-
-fn parse_strip_size(args: rpc::RpcCmdArgs, blocklen: usize) -> Result<usize, Error> {
-    let strip_size_kb = if let Some(strip_size_kb_str) = args.get("strip-size-kb") {
-        strip_size_kb_str.parse::<u32>()?
-    } else {
-        0
-    };
-    let mut strip_size = (strip_size_kb * 1024) as usize;
-    if strip_size == 0 {
-        strip_size = DEFAULT_STRIP_SIZE / blocklen * blocklen;
-    }
-    if strip_size.is_multiple_of(blocklen) {
-        Ok(strip_size)
-    } else {
-        Err(Error::InvalidArguments)
-    }
 }
 
 fn parse_children(children_names: &Vec<&str>) -> Result<(usize, u64), Error> {
@@ -253,10 +206,8 @@ fn rpc_rs_raid1_create(args: rpc::RpcCmdArgs) -> rpc::RpcCmdResult {
     let children_names_cs = args.get("children").ok_or(Error::InvalidArguments)?;
     let children_names: Vec<&str> = children_names_cs.split(',').collect();
     let (blocklen, num_blocks) = parse_children(&children_names)?;
-    let strip_size = parse_strip_size(args.clone(), blocklen)?;
-    let strip_blocks = strip_size / blocklen;
 
-    let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, strip_blocks, children_names)?);
+    let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, children_names)?);
 
     ironspdk::bdev_registry_add(name.to_string(), bdevh.clone())?;
 
