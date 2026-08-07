@@ -32,7 +32,7 @@ A cutting-edge Rust runtime that brings the power of modern async/await to SPDK 
 
 ### 🔀 Comprehensive I/O Abstractions
 * **Multiple I/O models**: Support for I/O references (`IoRef`), buffered I/O (`IoBuf`), and unified `Io` enum
-* **I/O splitting**: Advanced utilities for splitting and reordering I/O operations
+* **I/O splitting**: Advanced API for splitting and reordering I/O operations
 * **DMA buffers**: First-class support for aligned DMA memory allocation and management
 * **Block device abstraction**: Simple trait-based interface for implementing custom block devices
 
