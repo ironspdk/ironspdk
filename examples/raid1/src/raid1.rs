@@ -5,13 +5,15 @@ use ironspdk::rpc;
 use ironspdk::rpc_register;
 use ironspdk::{
     Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, Io, IoStatus, IoType, Lbdev, LbdevIoChannel,
-    RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, Tcb, thread_id,
+    RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC, SpdkThread, TlsKey, thread_id,
 };
 use log::{debug, error};
 use paste::paste;
 use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
+
+static IOCH_TLS: TlsKey<RcBdevIoChannel> = TlsKey::new(0);
 
 struct Raid1IoChannel {
     children: Vec<Rc<Lbdev>>,
@@ -44,7 +46,7 @@ impl Bdev for Raid1Bdev {
         for w in &self.workers {
             w.spawn(async move {
                 let refch = RcBdevIoChannel::new(rawbdev);
-                Tcb::current().set_io_channel(rawbdev, refch);
+                IOCH_TLS.set(refch);
             });
         }
     }
@@ -84,9 +86,7 @@ impl Bdev for Raid1Bdev {
         let self_ptr = self as *const Raid1Bdev;
         owner_thread.spawn(async move {
             let self1 = unsafe { &*self_ptr };
-            let refch = Tcb::current()
-                .io_channel(&io)
-                .expect("I/O channel not found");
+            let refch = IOCH_TLS.get().expect("I/O channel not found");
             let ch = refch.downcast_mut::<Raid1IoChannel>();
             match io.io_type() {
                 IoType::Read => self1.submit_read(&sender_thread, ch, io).await,

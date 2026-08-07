@@ -24,6 +24,10 @@ release: check-spdk
 	@echo "Building ironspdk rust crate (release)"
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo build --release
 
+lint:
+	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo fmt -- --check
+	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo clippy --locked --all --all-targets --tests -- -D warnings
+
 test-build: build-test-spdk cargo-build-debug
 
 # check-spdk: checks if SPDK build outputs look present; if not, invoke spdk
