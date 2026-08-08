@@ -142,7 +142,7 @@ impl Raid1Bdev {
                 failures.push(idx);
             }
         }
-        if failures.len() != 0 {
+        if !failures.is_empty() {
             if status == IoStatus::Failure {
                 error!("Write error (all disks failed) #{} {:?}", thread_id(), io);
             } else {
