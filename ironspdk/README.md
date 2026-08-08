@@ -353,8 +353,6 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-- [ ] More public API documentation
-- [ ] Documentation at docs.rs
 - [ ] Test coverage (cargo test)
 - [ ] Additional block device examples (encryption, RAID5)
 - [ ] T10 PI (DIF/DIX) support
