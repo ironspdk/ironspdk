@@ -61,10 +61,8 @@ void u_bdev_submit_request(struct spdk_io_channel *ch,
                            struct spdk_bdev_io *bdev_io)
 {
     void *bdev_ctxt = bdev_io->bdev->ctxt;
-    void *io_ch_ctxt = spdk_io_channel_get_ctx(ch);
-    struct io_channel_ctx *chctx = io_ch_ctxt;
 
-    rsu_bdev_submit_request(bdev_ctxt, chctx->rust_ch, bdev_io);
+    rsu_bdev_submit_request(bdev_ctxt, ch, bdev_io);
 }
 
 bool u_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
@@ -123,17 +121,13 @@ struct spdk_bdev *u_bdev_alloc(const char *name,
 
 int u_bdev_register(const char *name, struct spdk_bdev *bdev)
 {
-    int rc;
-
     spdk_io_device_register(bdev,
                             u_bdev_io_channel_create,
                             u_bdev_io_channel_destroy,
                             sizeof(struct io_channel_ctx),
                             name);
-    rc = spdk_bdev_register(bdev);
-    if (rc == 0)
-        rsu_bdev_init(bdev->ctxt);
-    return rc;
+    rsu_bdev_init(bdev->ctxt);
+    return spdk_bdev_register(bdev);
 }
 
 static void

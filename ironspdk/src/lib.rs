@@ -1,3 +1,50 @@
+#![doc = r#"
+
+# ironspdk
+
+`ironspdk` provides Rust abstractions for building SPDK applications and
+custom SPDK block devices.
+
+The library integrates Rust's ownership and asynchronous programming model
+with SPDK's reactor-based execution model. An SPDK thread acts as the
+execution context for Rust futures: tasks are polled by an SPDK poller rather
+than by a separate Rust async runtime.
+
+## Execution model
+
+Most `ironspdk` operations are tied to the current SPDK thread. In particular,
+SPDK I/O channels are thread-local resources and must only be accessed from
+the SPDK thread that owns them.
+
+[`SpdkThread`] provides a handle for addressing an SPDK thread and for
+submitting Rust futures to that thread.
+
+[`TlsKey`] provides typed thread-local storage associated with an SPDK
+thread.
+
+## I/O model
+
+Incoming SPDK bdev requests are represented by [`BdevIo`]. Their data can be
+accessed without copying through [`Io::Ref`] or copied into an owned DMA
+buffer using [`Io::Buf`] and [`DmaBuf`].
+
+The [`Bdev`] trait is the primary interface for implementing a
+`ironspdk`-backed SPDK block device.
+
+For accessing lower-layer SPDK block devices, [`Lbdev`] provides an
+asynchronous interface built on SPDK's bdev client API.
+
+## Thread SAFETY
+
+`ironspdk` does not provide general-purpose thread-safe access to SPDK objects.
+Types that can be moved or shared between Rust threads are explicitly
+documented as handles; the underlying SPDK operation still occurs according
+to SPDK's thread-affinity rules.
+
+When an API is restricted to an SPDK thread, that restriction is part of its
+safety contract and must be respected by callers.
+"#]
+
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -21,6 +68,7 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice::{Iter, IterMut, from_raw_parts, from_raw_parts_mut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use thiserror::Error;
@@ -35,6 +83,7 @@ pub mod rpc;
 static BDEV_REGISTRY: OnceLock<Mutex<HashMap<String, BdevHandle>>> = OnceLock::new();
 static TCB_REGISTRY: OnceLock<RwLock<HashMap<ThreadKey, TcbPtr>>> = OnceLock::new();
 
+/// Errors that can occur during ironspdk operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("This entity already exists")]
@@ -108,6 +157,20 @@ c_enum! {
 }
 
 c_enum! {
+/// Type of I/O operation.
+/// 
+/// This enum represents the different types of I/O operations that can be
+/// performed on block devices. It corresponds to SPDK's I/O type constants
+/// but provides a safe Rust interface.
+/// 
+/// # Examples
+/// 
+/// ```no_run
+/// use ironspdk::IoType;
+/// 
+/// let io_type = IoType::Read;
+/// println!("I/O type: {:?}", io_type);
+/// ```
     pub enum IoType: i32 {
         Invalid     = c::SPDK_BDEV_IO_TYPE_INVALID,
         Read        = c::SPDK_BDEV_IO_TYPE_READ,
@@ -150,28 +213,70 @@ impl Drop for DmaBufInner {
     }
 }
 
-/// Data buffer allocated from DMA memory.
-/// It may be shared between threads, so it implements Send+Sync+Clone.
+/// A buffer allocated from DMA-capable memory.
+///
+/// `DmaBuf` owns the underlying allocation and releases it with
+/// [`spdk_dma_free`](https://spdk.io/doc/memory.html) when dropped. The
+/// allocation is suitable for I/O operations that require DMA-accessible
+/// memory.
+///
+/// A `DmaBuf` can be cloned. Cloning shares ownership of the same allocation;
+/// it does not copy the contents of the buffer. Consequently, all clones
+/// refer to the same memory.
+///
+/// The buffer can be accessed as a byte slice with [`as_slice`](Self::as_slice)
+/// or [`as_mut_slice`](Self::as_mut_slice). Mutable access follows the usual
+/// Rust borrowing rules for a particular `DmaBuf`, but clones refer to the
+/// same underlying allocation, so callers must ensure that concurrent access
+/// through multiple clones does not violate the requirements of the operation
+/// using the buffer.
+///
+/// # Examples
+///
+/// Allocate a 16 KiB DMA buffer and initialize it:
+///
+/// ```no_run
+/// use ironspdk::DmaBuf;
+///
+/// fn alloc_and_init() -> Result<DmaBuf, ironspdk::Error> {
+///     let mut buf = DmaBuf::new_zeroed(16 * 1024)?;
+///     buf.as_mut_slice()[0] = 42;
+///     Ok(buf)
+/// }
+/// ```
+///
+/// Use [`new_aligned`](Self::new_aligned) when an alignment requirement other
+/// than the default is needed.
+///
+/// # Errors
+///
+/// The constructors return [`Error::NoMemory`] if SPDK cannot allocate the
+/// requested memory.
 #[derive(Debug)]
 pub struct DmaBuf {
     inner: DmaBufInner,
 }
 
 impl DmaBuf {
+    /// Default alignment for DMA buffers (4KB).
     const ALIGN_4K: usize = 4096;
 
+    /// Creates a new DMA buffer of the specified length.
     pub fn new(len: usize) -> Result<Self, Error> {
         Self::alloc(len, Self::ALIGN_4K, false)
     }
 
+    /// Creates a new DMA buffer with custom alignment.
     pub fn new_aligned(len: usize, align: usize) -> Result<Self, Error> {
         Self::alloc(len, align, false)
     }
 
+    /// Creates a new zeroed DMA buffer of the specified length.
     pub fn new_zeroed(len: usize) -> Result<Self, Error> {
         Self::alloc(len, Self::ALIGN_4K, true)
     }
 
+    /// Creates a new zeroed DMA buffer with custom alignment.
     pub fn new_aligned_zeroed(len: usize, align: usize) -> Result<Self, Error> {
         Self::alloc(len, align, true)
     }
@@ -188,6 +293,7 @@ impl DmaBuf {
         })
     }
 
+    /// Returns the length of the buffer in bytes.
     pub fn len(&self) -> usize {
         self.inner.len
     }
@@ -205,17 +311,54 @@ impl DmaBuf {
     }
 }
 
+/// A zero-copy view of an SPDK bdev I/O request.
+///
+/// `IoRef` describes the data buffers belonging to an existing
+/// [`BdevIo`]. It contains the request's scatter/gather I/O vectors rather
+/// than owning or copying their contents.
+///
+/// An `IoRef` therefore provides a view into memory owned by the original
+/// SPDK I/O request. The view must not outlive that request.
+///
+/// `IoRef` also carries the logical block range associated with the view.
+/// The range is expressed in units of `block_len` bytes.
+///
+/// Use [`Io::from_bdev_io`] to create an `IoRef` from an incoming bdev
+/// request. Use [`IoRef::to_buf`] when an owned DMA buffer is required.
+///
+/// # Zero-copy behavior
+///
+/// Creating an `IoRef` does not copy the request data. Operations such as
+/// [`iter_iov`](Io::iter_iov) access the original I/O vectors directly.
+///
+/// In contrast, [`IoRef::to_buf`] allocates a new [`DmaBuf`] and copies the
+/// referenced data into it.
+///
+/// # Block size
+///
+/// `block_len` controls the logical block size used by the resulting view.
+/// A value of `0` means that the block size of the underlying bdev request
+/// is used.
+///
+/// Currently, requests using DIF metadata are not supported.
 #[derive(Debug)]
 pub struct IoRef<'a> {
+    /// Scatter-gather list
     data_iovs: Vec<c::iovec>,
-    offset_blocks: u64, // LBA
-    ref_offset: usize,  // offset in parent ioref in self.block_len's, zero for parent
+    /// Logical block address (LBA)
+    offset_blocks: u64,
+    /// Offset in parent IoRef (in blocks), zero for parent
+    ref_offset: usize,
+    /// Number of blocks in the view
     num_blocks: usize,
+    /// Block length in bytes
     block_len: usize,
+    /// Phantom data to maintain lifetime
     _marker: PhantomData<&'a IoRef<'a>>,
 }
 
 impl<'a> IoRef<'a> {
+    /// Creates an I/O reference from a BdevIo.
     fn from_bdev_io(io: &BdevIo, block_len: usize) -> Result<Self, Error> {
         if io.dif_type() != DifType::Disable {
             error!("DIF metadata is not supported yet");
@@ -261,16 +404,18 @@ impl<'a> IoRef<'a> {
         })
     }
 
-    /// Change 'offset_blocks' of IoRef
-    /// (for example when splitting or reordering) using this method
+    /// Updates the offset in blocks.
+    /// This method is useful when splitting or reordering I/O operations.
     pub fn update_offset_blocks(&mut self, offset_blocks: u64) {
         self.offset_blocks = offset_blocks;
     }
 
+    /// Returns the total number of bytes in the I/O reference.
     pub fn total_bytes(&self) -> usize {
         self.num_blocks * self.block_len
     }
 
+    /// Converts the I/O reference to an owned I/O buffer.
     pub fn to_buf(&self) -> Result<IoBuf, Error> {
         let total = self.total_bytes();
         let mut dmabuf = DmaBuf::new(total)?;
@@ -435,6 +580,26 @@ impl<'a> IoRefSplitter<'a> {
     }
 }
 
+/// An I/O operation that can be either a reference or an owned buffer.
+/// 
+/// This enum allows handling both zero-copy (`IoRef`) and copy-based (`IoBuf`)
+/// I/O operations uniformly. It provides methods to query properties and
+/// iterate over I/O vectors.
+/// 
+/// # Examples
+/// 
+/// Creating an I/O operation:
+/// 
+/// ```no_run
+/// use ironspdk::{DmaBuf, Io};
+///
+/// fn create_io() -> Result<Io<'static>, ironspdk::Error> {
+///     let buf = DmaBuf::new(4096)?;
+///     let io = Io::new_buf(buf, 0, 512)?;
+///     println!("I/O blocks: {}", io.num_blocks());
+///     Ok(io)
+/// }
+/// ```
 #[derive(Debug)]
 pub enum Io<'a> {
     Ref(IoRef<'a>),
@@ -442,15 +607,18 @@ pub enum Io<'a> {
 }
 
 impl<'a> Io<'a> {
+    /// Creates a new I/O operation from a DMA buffer.
     pub fn new_buf(data: DmaBuf, offset_blocks: u64, block_len: usize) -> Result<Self, Error> {
         let buf = IoBuf::new(data, offset_blocks, block_len)?;
         Ok(Io::Buf(buf))
     }
 
+    /// Creates an I/O operation from a BdevIo.
     pub fn from_bdev_io(io: &BdevIo, block_len: usize) -> Result<Self, Error> {
         Ok(Io::Ref(IoRef::from_bdev_io(io, block_len)?))
     }
 
+    /// Returns `true` if this is a reference (zero-copy).
     pub fn is_ref(&self) -> bool {
         match self {
             Io::Ref(_) => true,
@@ -458,6 +626,16 @@ impl<'a> Io<'a> {
         }
     }
 
+    /// Splits the I/O into smaller blocks.
+    /// 
+    /// # Parameters
+    /// 
+    /// * `child_block_len` - Optional block length for children (defaults to parent's)
+    /// 
+    /// # Returns
+    /// 
+    /// Returns an `IoRefSplitter` for splitting the I/O, or an error if
+    /// the I/O is not a reference (`Error::UnsupportedOperation`).
     pub fn split(&'a self, child_block_len: Option<usize>) -> Result<IoRefSplitter<'a>, Error> {
         match self {
             Io::Ref(ioref) => Ok(IoRefSplitter::new(ioref, child_block_len)),
@@ -465,6 +643,7 @@ impl<'a> Io<'a> {
         }
     }
 
+    /// Returns the offset in blocks (LBA).
     pub fn offset_blocks(&self) -> u64 {
         match self {
             Io::Ref(ioref) => ioref.offset_blocks,
@@ -472,6 +651,7 @@ impl<'a> Io<'a> {
         }
     }
 
+    /// Returns the number of blocks.
     pub fn num_blocks(&self) -> usize {
         match self {
             Io::Ref(ioref) => ioref.num_blocks,
@@ -479,6 +659,7 @@ impl<'a> Io<'a> {
         }
     }
 
+    /// Returns the block length in bytes.
     pub fn block_len(&self) -> usize {
         match self {
             Io::Ref(ioref) => ioref.block_len,
@@ -486,6 +667,23 @@ impl<'a> Io<'a> {
         }
     }
 
+    /// Returns an iterator over I/O vectors.
+    /// 
+    /// This iterator yields slices for each I/O vector in the operation.
+    /// 
+    /// # Examples
+    /// 
+    /// ```no_run
+    /// use ironspdk::{DmaBuf, Error, Io};
+    /// 
+    /// fn count_total_bytes(io: &Io) -> Result<usize, Error> {
+    ///     let buf = DmaBuf::new(1024)?;
+    ///     let io = Io::new_buf(buf, 0, 512)?;
+    ///     let total: usize = io.iter_iov().map(|s| s.len()).sum();
+    ///     assert_eq!(total, 1024);
+    ///     Ok(total)
+    /// }
+    /// ```
     pub fn iter_iov(&self) -> IoIter<'_> {
         match self {
             Io::Ref(ioref) => {
@@ -498,6 +696,22 @@ impl<'a> Io<'a> {
         }
     }
 
+    /// Returns a mutable iterator over I/O vectors.
+    /// 
+    /// # Examples
+    /// 
+    /// ```no_run
+    /// use ironspdk::{DmaBuf, Error, Io};
+    /// 
+    /// fn fill_iov(io: &mut Io) -> Result<(), Error> {
+    ///     let buf = DmaBuf::new(1024)?;
+    ///     let mut io = Io::new_buf(buf, 0, 512)?;
+    ///     for slice in io.iter_iov_mut() {
+    ///         slice.fill(0xFF);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn iter_iov_mut(&mut self) -> IoIterMut<'_> {
         match self {
             Io::Ref(ioref) => {
@@ -511,26 +725,54 @@ impl<'a> Io<'a> {
     }
 }
 
+/// Represents a range of blocks in an I/O operation.
 #[derive(Debug, Copy, Clone)]
 pub struct IoRange {
     lba: u64,
     num_blocks: u64,
 }
 
+/// Status of an I/O operation.
 #[derive(PartialEq)]
 pub enum IoStatus {
     Success,
     Failure,
 }
 
-/// Rust BdevIo wrapper around 'struct spdk_bdev_io'
+/// Rust wrapper around SPDK's `struct spdk_bdev_io`
 /// with completion future. Should be used by implementors of
 /// 'trait Bdev'
+/// 
+/// This structure represents an in-flight or completed I/O operation. It provides
+/// a safe interface to SPDK's I/O completion mechanism via futures.
+/// 
+/// # Async Completion
+/// 
+/// I/O operations are completed asynchronously using futures:
+/// 
+/// ```no_run
+/// use ironspdk::BdevIo;
+/// 
+/// async fn process_io(io: BdevIo) {
+///     // Wait for I/O completion
+///     io.future().await;
+///     println!("I/O completed");
+/// }
+/// ```
+/// 
+/// # SAFETY
+/// 
+/// The `BdevIo` wrapper maintains safety invariants:
+/// - The raw SPDK pointer is guaranteed non-null
+/// - The future is properly synchronized
+/// - Completion is handled safely
 pub struct BdevIo {
+    /// Raw SPDK bdev_io pointer
     raw: NonNull<c::spdk_bdev_io>,
 
-    // BdevIo is immutable by nature, but related future must be mutable.
-    // That's why we use UnsafeCell here
+    /// Future for async completion.
+    /// BdevIo is immutable by nature, but related future must be mutable.
+    /// That's why we use UnsafeCell here.
     fut: UnsafeCell<IoFuture>,
 }
 
@@ -548,15 +790,31 @@ impl std::fmt::Debug for BdevIo {
 }
 
 impl BdevIo {
+    /// Creates a new BdevIo wrapper from a raw SPDK pointer.
     pub fn new(raw: *mut c::spdk_bdev_io) -> Self {
         let fut = UnsafeCell::new(IoFuture::new());
         let raw = NonNull::new(raw).expect("bdev io pointer must not be null");
         Self { raw, fut }
     }
 
+    /// Returns a mutable reference to the I/O future.
     /// This method should be called to complete async I/O.
-    ///     Example:
-    ///         io.future().await;
+    /// 
+    /// # SAFETY
+    /// 
+    /// This method is safe because:
+    /// - The future is only accessed by one thread at a time
+    /// - SPDK guarantees that I/O completion callbacks are serialized
+    /// 
+    /// # Examples
+    /// 
+    /// ```no_run
+    /// use ironspdk::BdevIo;
+    /// 
+    /// async fn wait_for_io(io: &BdevIo) {
+    ///     io.future().await;
+    /// }
+    /// ```
     #[allow(clippy::mut_from_ref)]
     pub fn future(&self) -> &mut IoFuture {
         unsafe { &mut *self.fut.get() }
@@ -567,6 +825,19 @@ impl BdevIo {
         unsafe { c::spdk_bdev_io_complete(self.raw.as_ptr(), status) };
     }
 
+    /// Completes the I/O operation with the given status.
+    /// 
+    /// This method signals the future and calls SPDK's completion function.
+    /// 
+    /// # Examples
+    /// 
+    /// ```no_run
+    /// use ironspdk::{BdevIo, IoStatus};
+    /// 
+    /// fn complete_io(io: &BdevIo) {
+    ///     io.complete(IoStatus::Success);
+    /// }
+    /// ```
     pub fn complete(&self, status: IoStatus) {
         let status = match status {
             IoStatus::Success => c::SPDK_BDEV_IO_STATUS_SUCCESS,
@@ -575,25 +846,35 @@ impl BdevIo {
         self.spdk_complete(status);
     }
 
+    /// Completes the I/O operation on a specific SPDK thread.
+    /// 
+    /// This is useful when the I/O needs to be completed on a different thread
+    /// than the one it was submitted on.
     pub fn complete_on(self, thread: &SpdkThread, status: IoStatus) {
         thread.send_msg(move || {
             self.complete(status);
         });
     }
 
+    /// Returns the I/O type (read, write, etc.).
     pub fn io_type(&self) -> IoType {
         let c_io_type = unsafe { c::u_bdev_io_get_type(self.raw.as_ptr()) };
         IoType::try_from_c(c_io_type).unwrap_or_else(|_| panic!("Invalid C io type: {}", c_io_type))
     }
 
+    /// Returns the offset in blocks (LBA).
     pub fn offset_blocks(&self) -> u64 {
         unsafe { c::u_bdev_io_get_offset_blocks(self.raw.as_ptr()) }
     }
 
+    /// Returns the number of blocks in the I/O.
     pub fn num_blocks(&self) -> u64 {
         unsafe { c::u_bdev_io_get_num_blocks(self.raw.as_ptr()) }
     }
 
+    /// Returns the I/O range if applicable.
+    /// 
+    /// Only read and write I/O types have a range. Other types return `None`.
     pub fn range(&self) -> Option<IoRange> {
         match self.io_type() {
             IoType::Read | IoType::Write => Some(IoRange {
@@ -613,6 +894,7 @@ impl BdevIo {
         BdevId(self.spdk_bdev().as_ptr() as usize)
     }
 
+    /// Returns the block length in bytes.
     pub fn block_len(&self) -> usize {
         let bdev = self.spdk_bdev().as_ptr();
         (unsafe { c::spdk_bdev_get_block_size(bdev) }) as usize
@@ -644,6 +926,89 @@ impl BdevIoChannel {
     }
 }
 
+/// Lightweight wrapper of 'struct spdk_io_channel'.
+/// 
+/// Borrows existing SPDK channel.
+/// Constructed by ironspdk linbrary and passed to `Bdev.submit_io()`.
+/// This is a borrowed reference that does not acquire
+/// ownership of the channel.
+///
+/// # SAFETY
+/// 
+/// The handle may only be used on the SPDK thread that owns the channel.
+/// Use [`RcBdevIoChannel`] when a channel must be retained by a custom
+/// SPDK thread.
+///
+/// # Usage
+/// 
+/// ```no_run
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoType, SpdkThread};
+/// use std::os::raw::c_void;
+/// use std::ptr::NonNull;
+/// 
+/// struct MyIoChannel;
+/// struct MyBdev;
+/// 
+/// impl Bdev for MyBdev {
+///     fn init(&self, _: NonNull<c_void>) { todo!() }
+///     fn io_type_supported(&self, _: IoType) -> bool { todo!() }
+///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
+///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
+///         // ... process I/O ...
+///         let submit_thread = SpdkThread::current();
+///         submit_thread.spawn(async move {
+///             let ch = ch.downcast_mut::<MyIoChannel>();
+///             // ... use channel ...
+///         });
+///     }
+/// }
+/// ```
+#[derive(Clone, Copy)]
+pub struct BdevIoChannelRef {
+    /// Raw SPDK `struct spdk_io_channnel *` pointer
+    raw: NonNull<c::spdk_io_channel>,
+}
+
+impl std::fmt::Debug for BdevIoChannelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BdevIoChannelRef(raw: {:p})", self.raw.as_ptr())
+    }
+}
+
+impl BdevIoChannelRef {
+    /// Creates a borrowed reference to an existing SPDK I/O channel.
+    ///
+    /// # SAFETY
+    /// 
+    /// `raw` must be a valid `spdk_io_channel` belonging to the current
+    /// SPDK thread. The returned value does not acquire a reference to the
+    /// channel and must not outlive the channel.
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if `raw` is null.
+    pub(crate) unsafe fn from_raw(raw: *mut c::spdk_io_channel) -> Self {
+        Self {
+            raw: NonNull::new(raw).expect("SPDK io channel null pointer"),
+        }
+    }
+
+    /// Returns mutable access to the Rust channel context.
+    ///
+    /// # SAFETY invariant
+    /// SPDK invokes a bdev's submit_request callback serially for a given
+    /// SPDK thread, and the channel belongs exclusively to that thread.
+    /// Therefore the returned mutable reference will not be used concurrently.
+    #[allow(clippy::mut_from_ref)]
+    pub fn downcast_mut<T: Any>(&self) -> &mut T {
+        let spdk_ch_ctx = unsafe { c::u_spdk_io_channel_get_ctx(self.raw.as_ptr()) };
+        let io_ch_ctx = unsafe { c::u_io_channel_get_rust_ctx(spdk_ch_ctx) };
+        debug_assert!(!io_ch_ctx.is_null());
+        let ch = unsafe { &mut *(io_ch_ctx as *mut BdevIoChannel) };
+        ch.downcast_mut::<T>()
+    }
+}
+
 /// Reference-counted bdev I/O channel wrapper.
 /// It uses (struct spdk_io_channel).ref as a non-atomic reference counter.
 /// It should be used by custom SPDK threads (created manually
@@ -655,7 +1020,12 @@ pub struct RcBdevIoChannel {
 impl std::fmt::Debug for RcBdevIoChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let refcnt = unsafe { c::spdk_io_channel_get_ref_count(self.raw.as_ptr()) };
-        write!(f, "RcBdevIoChannel(raw: {:p}, ref: {})", self.raw, refcnt)
+        write!(
+            f,
+            "RcBdevIoChannel(raw: {:p}, ref: {})",
+            self.raw.as_ptr(),
+            refcnt
+        )
     }
 }
 
@@ -692,22 +1062,175 @@ impl RcBdevIoChannel {
     }
 }
 
-/// Rust Bdev trait. If you write ironspdk Rust bdev module,
-/// you should implement this trait.
+/// A Rust implementation of an SPDK block device.
+///
+/// Implement this trait to expose a Rust object as an SPDK bdev. The
+/// implementation is responsible for accepting I/O requests from SPDK,
+/// performing the requested operation, and completing each request.
+///
+/// A `Bdev` implementation is executed by SPDK's reactor threads. The
+/// [`Bdev::submit_io`] (equivalent of SPDK's .submit_request())
+/// method is called in the context of the
+/// SPDK thread that submitted the request, and the implementation must obey
+/// SPDK's thread-affinity rules. In particular, SPDK objects such as I/O
+/// channels must only be accessed from the SPDK thread that owns them.
+///
+/// # I/O processing
+///
+/// [`Bdev::submit_io`] receives a [`BdevIo`] representing one SPDK I/O request.
+/// The request may contain scatter/gather buffers and can be accessed
+/// through the [`BdevIo`] API without copying the data.
+///
+/// `fn submit_io()` is not async. However it can spawn a future on SPDK
+/// thread (current or another).
+/// The future is polled by the `ironspdk` executor associated with related
+/// SPDK thread. This makes it possible to express asynchronous I/O using
+/// Rust's `async`/`await` syntax while retaining SPDK's reactor-based
+/// execution model.
+///
+/// The implementation must eventually complete the request by calling
+/// [`BdevIo::complete`] or [`BdevIo::complete_on`].
+///
+/// # I/O completion
+///
+/// An implementation should normally perform the asynchronous work and then
+/// complete the request by calling [`BdevIo::complete`] or
+/// [`BdevIo::complete_on`] with the appropriate [`IoStatus`]:
+///
+/// ```no_run
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoStatus, IoType};
+/// use std::os::raw::c_void;
+/// use std::ptr::NonNull;
+/// 
+/// struct MyBdev;
+/// 
+/// impl Bdev for MyBdev {
+///     fn init(&self, _: NonNull<c_void>) { todo!() }
+///     fn io_type_supported(&self, _: IoType) -> bool { todo!() }
+///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
+///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
+///         // Perform the operation...
+///
+///         io.complete(IoStatus::Success);
+///     }
+/// }
+/// ```
+///
+/// The exact lifetime of `io` is determined by the `BdevIo` API. References
+/// obtained from the request must not be retained after the request is no
+/// longer valid.
+///
+/// # I/O channels
+///
+/// [`Bdev::create_io_channel`] is used by SPDK to create
+/// the per-thread context required by the bdev implementation. An I/O
+/// channel is associated with a particular SPDK thread and is not a global
+/// resource shared by all threads.
+///
+/// The channel context can be obtained from `submit_io()` through the
+/// [`BdevIoChannelRef`] associated with the current request.
+///
+/// If an implementation needs to perform work on another SPDK thread, it
+/// must use that thread's I/O channel rather than using the channel belonging
+/// to the submitting thread.
+///
+/// # Thread SAFETY
+///
+/// The trait itself does not require a bdev implementation to be `Send` or
+/// `Sync`. This is intentional: a bdev may contain state that is accessed
+/// exclusively from an SPDK thread.
+///
+/// When state is accessed from multiple SPDK threads, the implementation
+/// must provide the required synchronization or otherwise arrange its work so
+/// that each piece of mutable state has a single owning SPDK thread.
+///
+/// # Supported I/O types
+///
+/// [`Bdev::io_type_supported`] determines which SPDK I/O
+/// operations the bdev accepts. SPDK may reject or avoid submitting an
+/// operation that the bdev reports as unsupported.
+///
+/// A bdev should only report an I/O type as supported when its implementation
+/// can correctly process the corresponding request and complete it according
+/// to SPDK's bdev semantics.
+///
+/// # Implementing a bdev
+///
+/// A typical implementation consists of:
+///
+/// 1. [`io_type_supported`](Bdev::io_type_supported) to advertise supported
+///    operations.
+/// 2. [`create_io_channel`](Bdev::create_io_channel) to create per-SPDK-thread
+///    state.
+/// 3. [`submit_io`](Bdev::submit_io) to process requests asynchronously.
+/// 4. [`BdevIo::complete`] to report the result of each request.
+///
+/// The bdev can then be registered with SPDK using the appropriate bdev
+/// registration API.
+///
+/// # SAFETY and invariants
+///
+/// Implementations must preserve the invariants required by both Rust and
+/// SPDK. In particular:
+///
+/// * An I/O request must not be completed more than once.
+/// * An I/O request must eventually be completed unless SPDK explicitly
+///   permits it to remain outstanding.
+/// * Buffers borrowed from a request must not outlive the request.
+/// * SPDK thread-affine objects must only be accessed from their owning
+///   SPDK thread.
+/// * An I/O channel must remain valid for as long as the implementation uses
+///   it.
+///
+/// Violating these requirements can result in memory corruption, use-after-free,
+/// data races, or other undefined behavior.
+///
+/// # Examples
+///
+/// A minimal bdev implementation has the following shape:
+///
+/// ```no_run
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoStatus, IoType, RawBdevHandle, SpdkThread};
+/// 
+/// struct MyBdev;
+///
+/// impl Bdev for MyBdev {
+///     fn init(&self, rawbdev: RawBdevHandle) {
+///         // Perform initialization,
+///         // e.g. spawn workers, allocate I/O channels etc.
+///     }
+/// 
+///     fn io_type_supported(&self, io_type: IoType) -> bool {
+///         matches!(io_type, IoType::Read | IoType::Write)
+///     }
+///
+///     fn create_io_channel(&self) -> Box<BdevIoChannel> {
+///         // Create per-SPDK-thread state.
+///         todo!()
+///     }
+///
+///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
+///         SpdkThread::current().spawn(async move {
+///             // Process `io` using `channel`.
+///             io.complete(IoStatus::Success);
+///         });
+///     }
+/// }
+/// ```
 pub trait Bdev {
-    fn init(&self, ctx: RawBdevHandle);
+    fn init(&self, rawbdev: RawBdevHandle);
 
     fn io_type_supported(&self, io_type: IoType) -> bool;
 
     fn create_io_channel(&self) -> Box<BdevIoChannel>;
 
-    fn submit_io(&self, ch: &mut BdevIoChannel, io: BdevIo);
+    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo);
 }
 
 /// Handle for passing Bdev-s to C FFI
 pub type BdevHandle = Arc<dyn Bdev + Send + Sync + 'static>;
 
-/// Handle for passing bdevs between Rust SpdkThread-s
+/// Handle for passing bdevs between `ironspdk` SpdkThread-s
 pub type RawBdevHandle = NonNull<c::spdk_bdev>;
 
 pub struct BdevCtx {
@@ -826,27 +1349,26 @@ extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: i32)
 #[unsafe(no_mangle)]
 extern "C" fn rsu_bdev_init(bdev_ctxt: *mut c_void) {
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
-    ctx.bdev
-        .init(NonNull::new(ctx.spdk_bdev).expect("bdev pointer must not be NULL"));
+    let rawbdev = NonNull::new(ctx.spdk_bdev).expect("bdev pointer must not be NULL");
+    ctx.bdev.init(rawbdev);
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn rsu_bdev_submit_request(
     bdev_ctxt: *mut c_void,
-    io_ch_ctxt: *mut c_void,
+    ch: *mut c::spdk_io_channel,
     io: *mut c::spdk_bdev_io,
 ) {
     debug_assert!(!bdev_ctxt.is_null());
-    debug_assert!(!io_ch_ctxt.is_null());
+    debug_assert!(!ch.is_null());
 
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
 
     let io = BdevIo::new(io);
-    let ch: &mut BdevIoChannel = unsafe { &mut *(io_ch_ctxt as *mut BdevIoChannel) };
 
-    SpdkThread::current().spawn(async move {
-        ctx.bdev.submit_io(ch, io);
-    });
+    let ch = unsafe { BdevIoChannelRef::from_raw(ch) };
+
+    ctx.bdev.submit_io(ch, io);
 }
 
 // SPDK poller trampoline
@@ -914,11 +1436,30 @@ impl Drop for CpuSet {
     }
 }
 
-// *** Rust asynchronous runtime for SPDK ***
-
-/// SPDK thread wrapper
+/// SPDK thread wrapper.
+/// Represents an SPDK lightweight thread with its associated reactor.
+/// 
+/// SPDK uses a thread-per-core model where each thread has its own
+/// reactor and processes I/O completions. This structure provides
+/// a safe interface to SPDK's threading primitives.
+/// 
+/// # Thread Safety
+/// 
+/// - Each SPDK thread is bound to a specific CPU core
+/// - I/O channels are thread-local
+/// - Messages can be sent between threads using `send_msg`
+/// 
+/// # Examples
+/// 
+/// ```no_run
+/// use ironspdk::SpdkThread;
+/// use log::debug;
+/// 
+/// debug!("current SPDK thread ID: {}", SpdkThread::current().id());
+/// ```
 #[derive(Clone)]
 pub struct SpdkThread {
+    /// Raw SPDK `struct spdk_thread *` pointer
     raw: NonNull<c::spdk_thread>,
 }
 
@@ -927,11 +1468,17 @@ pub struct SpdkThread {
 unsafe impl Send for SpdkThread {}
 unsafe impl Sync for SpdkThread {}
 
+/// Convenience wrapper function to get current SPDK thread ID.
 pub fn thread_id() -> u64 {
     SpdkThread::current().id()
 }
 
 impl SpdkThread {
+    /// Returns the current SPDK thread.
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if called outside of an SPDK thread.
     pub fn current() -> Self {
         let raw = unsafe { c::spdk_get_thread() };
         Self {
@@ -939,26 +1486,32 @@ impl SpdkThread {
         }
     }
 
+    /// Returns `true` if this thread is the current SPDK thread.
     pub fn is_current(&self) -> bool {
         self.raw.as_ptr() == unsafe { c::spdk_get_thread() }
     }
 
+    /// Returns the number of CPU cores available to SPDK.
     pub fn core_count() -> u32 {
         unsafe { c::spdk_env_get_core_count() }
     }
 
+    /// Wrapper around `spdk_thread_is_running()`.
     pub fn is_running(&self) -> bool {
         unsafe { c::spdk_thread_is_running(self.raw.as_ptr()) }
     }
 
+    /// Wrapper around `spdk_thread_is_exited()`.
     pub fn is_exited(&self) -> bool {
         unsafe { c::spdk_thread_is_exited(self.raw.as_ptr()) }
     }
 
+    /// Creates a new SPDK thread with the given name.
     pub fn new(name: &str) -> Self {
         Self::new_at_cpuset(name, None)
     }
 
+    /// Creates a new SPDK thread with the given name at specified CPU cores.
     pub fn new_at_cores<I>(name: &str, cores: I) -> Self
     where
         I: IntoIterator<Item = u32>,
@@ -967,6 +1520,8 @@ impl SpdkThread {
         Self::new_at_cpuset(name, Some(&cpuset))
     }
 
+    ///
+    /// Creates a new SPDK thread with the given name and optional CPU set. 
     pub fn new_at_cpuset(name: &str, cpuset: Option<&CpuSet>) -> Self {
         let name_c = CString::new(name).unwrap();
         let raw = unsafe {
@@ -980,6 +1535,7 @@ impl SpdkThread {
         }
     }
 
+    /// Returns SPDK thread ID.
     pub fn id(&self) -> u64 {
         unsafe { c::spdk_thread_get_id(self.raw.as_ptr()) }
     }
@@ -1007,6 +1563,9 @@ impl SpdkThread {
         }
     }
 
+    /// Spawns a future on this thread.
+    /// 
+    /// The future will be polled on the thread's reactor.
     pub fn spawn<F>(&self, fut: F)
     where
         F: Future<Output = ()> + 'static,
@@ -1017,6 +1576,12 @@ impl SpdkThread {
         });
     }
 
+    /// Requests the SPDK thread to exit.
+    /// 
+    /// # SAFETY
+    /// 
+    /// This is the only legitimate way to request an SPDK thread to exit.
+    /// It will trigger the thread's exit sequence.
     pub fn request_exit(&self) {
         self.send_msg(|| unsafe {
             c::spdk_thread_exit(c::spdk_get_thread());
@@ -1024,45 +1589,258 @@ impl SpdkThread {
     }
 }
 
-/// Rust thread control block (per SPDK thread)
-/// It contains
-///     - executor tied with SPDK poller
-///     - storage for I/O channels owned by this SPDK thread
-pub struct Tcb {
+pub const TLS_SLOTS: usize = 4;
+
+///
+/// SPDK TLS interface
+///
+/// It introduces SPDK TLS (which is not present in native SPDK)
+/// ironspdk library user can store/load values at several TLS keys
+/// (maximum count of keys is TLS_SLOTS). SPDK TLS values are visible
+/// to current SPDK thread only and live while it lives.
+/// SPDK TLS is cheap: takes one cache line of memory and
+/// O(1) of time at loading/storing.
+///
+/// SAFETY: The code of TlsKey::new() and TlsKey::alloc() panics if key slot
+/// count exceeds TLS_SLOTS. This in intentional: SPDK TLS is a limited resource
+/// and should not be wasted.
+///
+/// Usage example:
+///    let my_type_tls = TlsKey<MyType>::alloc(); // allocate the key at free slot
+///    my_type_tls.set(MyType {...});
+///    let val = my_type_tls.get()?;
+///
+/// or
+///
+///    static MY_TYPE_TLS = TlsKey<MyType>::new(0); // explicitly take a slot with index 0
+///    ...
+///    MY_TYPE_TLS.set(MyType {...});
+///    let val = MY_TYPE_TLS.get()?;
+///
+pub struct TlsKey<T: 'static> {
+    slot: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+unsafe impl<T: 'static> Send for TlsKey<T> {}
+unsafe impl<T: 'static> Sync for TlsKey<T> {}
+
+impl<T: 'static> Clone for TlsKey<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static> Copy for TlsKey<T> {}
+
+impl<T: 'static> TlsKey<T> {
+    /// Const constructor for `static` declarations.
+    /// The caller picks the index explicitly.
+    pub const fn new(slot: usize) -> Self {
+        assert!(slot < TLS_SLOTS, "TLS slot index out of bounds");
+        Self {
+            slot,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Dynamic allocator for non-static use
+    pub fn alloc() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let slot = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(slot < TLS_SLOTS, "out of TLS slots");
+        Self {
+            slot,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn set(&self, value: T) {
+        Tcb::current().tls.set(self, value);
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        Tcb::current().tls.get(self)
+    }
+
+    #[inline]
+    pub fn get_mut(&self) -> Option<&mut T> {
+        Tcb::current().tls.get_mut(self)
+    }
+
+    pub fn clear(&self) {
+        Tcb::current().tls.clear_slot(self.slot);
+    }
+}
+
+// SPDK TLS representation.
+// No heap, no atomics, no locks, no reallocs
+#[repr(align(64))]
+struct Tls {
+    slots: [UnsafeCell<*mut c_void>; TLS_SLOTS],
+    drop_fns: [UnsafeCell<Option<DropFn>>; TLS_SLOTS],
+}
+
+type DropFn = unsafe fn(*mut c_void);
+
+// SAFETY: TLS is only accessed by SPDK thread that owns the TCB
+unsafe impl Send for Tls {}
+unsafe impl Sync for Tls {}
+
+unsafe fn drop_box<T>(p: *mut c_void) {
+    drop(unsafe { Box::from_raw(p as *mut T) });
+}
+
+impl Default for Tls {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tls {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| UnsafeCell::new(std::ptr::null_mut())),
+            drop_fns: std::array::from_fn(|_| UnsafeCell::new(None)),
+        }
+    }
+
+    #[inline]
+    fn set<T: 'static>(&self, key: &TlsKey<T>, value: T) {
+        self.clear_slot(key.slot);
+        let ptr = Box::into_raw(Box::new(value));
+        unsafe {
+            *self.slots[key.slot].get() = ptr as *mut c_void;
+            *self.drop_fns[key.slot].get() = Some(drop_box::<T>);
+        }
+    }
+
+    #[inline]
+    fn get<T: 'static>(&self, key: &TlsKey<T>) -> Option<&T> {
+        let ptr = unsafe { *self.slots[key.slot].get() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*(ptr as *const T) })
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    fn get_mut<T: 'static>(&self, key: &TlsKey<T>) -> Option<&mut T> {
+        let ptr = unsafe { *self.slots[key.slot].get() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *(ptr as *mut T) })
+        }
+    }
+
+    fn clear_all(&self) {
+        for i in 0..TLS_SLOTS {
+            self.clear_slot(i);
+        }
+    }
+
+    #[inline]
+    fn clear_slot(&self, index: usize) {
+        let ptr = unsafe { *self.slots[index].get() };
+        if !ptr.is_null() {
+            if let Some(drop_fn) = unsafe { *self.drop_fns[index].get() } {
+                unsafe { drop_fn(ptr) };
+            }
+            unsafe {
+                *self.slots[index].get() = std::ptr::null_mut();
+                *self.drop_fns[index].get() = None;
+            }
+        }
+    }
+}
+
+//
+// Use local TLS to access TCB in O(1) time.
+// Store spdk_thread ID (which is unique and increases on creation of
+// new spdk_thread-s) and TCB.
+// This facilitates survival if and when SPDK migrates spdk_thread to other reactor
+//
+std::thread_local! {
+    // 0 means “no cache”. spdk_thread IDs start at 1.
+    static CACHED_THREAD_ID: Cell<u64> = const { Cell::new(0) };
+    static CACHED_TCB: Cell<*const Tcb> = const { Cell::new(std::ptr::null()) };
+}
+
+// Thread Control Block (per SPDK thread)
+// It stores
+//     - executor tied with SPDK poller
+//     - thread-local storage
+// This interface is internal for ironspdk runtime.
+struct Tcb {
     runq: RefCell<VecDeque<Rc<Task>>>,
     poller: Cell<*mut c::spdk_poller>,
-    io_channels: RefCell<HashMap<BdevId, RefCell<RcBdevIoChannel>>>,
+    tls: Tls,
 }
 
 impl Tcb {
-    pub fn current() -> &'static Self {
+    // Get current TCB
+    // Hot path: 2 loads + 1 u64 compare + 1 branch
+    // Slow path: one RwLock read, executed on SPDK thread cross-reactor migration
+    #[inline]
+    fn current() -> &'static Self {
         let thread = unsafe { c::spdk_get_thread() };
-        assert!(!thread.is_null(), "Not on SPDK thread");
+        assert!(
+            !thread.is_null(),
+            "Tcb::current() called outside of SPDK thread"
+        );
 
-        let thread_key = ThreadKey::from_thread(thread);
+        let current_id = unsafe { c::spdk_thread_get_id(thread) };
+        let cached_id = CACHED_THREAD_ID.with(|c| c.get());
+        if cached_id == current_id {
+            let ptr = CACHED_TCB.with(|c| c.get());
+            // SAFETY: SPDK thread IDs are unique and monotonic.
+            // Equity means thread has not changed and CACHED_TCB points to
+            // real TCB
+            unsafe { &*ptr }
+        } else {
+            Self::current_slow(thread, current_id)
+        }
+    }
 
-        // fast path (lock for read)
+    #[cold]
+    fn tcb_ptr_from_registry(thread_key: ThreadKey) -> *const Tcb {
+        // fast path: try read existing value
         {
             let map = tcb_registry().read();
             if let Some(&tcb_ptr) = map.get(&thread_key) {
                 return unsafe { &*(tcb_ptr.ptr() as *const Tcb) };
             }
         }
-
-        // slow path (lock for write)
+        // slow path: read-or-create value
         let mut map = tcb_registry().write();
         let tcb_ptr = map.entry(thread_key).or_insert_with(|| {
             let tcb = Tcb::new();
             TcbPtr::from_tcb(tcb)
         });
-        unsafe { &*(tcb_ptr.ptr() as *const Tcb) }
+        tcb_ptr.ptr() as *const Tcb
+    }
+
+    #[cold]
+    fn current_slow(thread: *mut c::spdk_thread, thread_id: u64) -> &'static Self {
+        let thread_key = ThreadKey::from_thread(thread);
+        let tcb_ptr = Self::tcb_ptr_from_registry(thread_key);
+
+        CACHED_THREAD_ID.with(|c| c.set(thread_id));
+        CACHED_TCB.with(|c| c.set(tcb_ptr));
+
+        unsafe { &*tcb_ptr }
     }
 
     fn new() -> *mut Tcb {
         let tcb = Box::new(Tcb {
             runq: RefCell::new(VecDeque::new()),
             poller: Cell::new(std::ptr::null_mut()),
-            io_channels: RefCell::new(HashMap::new()),
+            tls: Tls::new(),
         });
 
         let tcb_ptr = Box::into_raw(tcb);
@@ -1108,36 +1886,29 @@ impl Tcb {
     }
 
     fn shutdown(&self) {
-        let mut map = tcb_registry().write();
         let thread = unsafe { c::spdk_get_thread() };
         assert!(!thread.is_null(), "Not on SPDK thread");
 
-        // Remove association between thread and TCB
-        let thread_key = ThreadKey::from_thread(thread);
-        let _ = map.remove(&thread_key).unwrap();
+        // Call drop() on TLS slots. Write lock must not be taken yet
+        self.tls.clear_all();
 
-        // Drain and drop io channels
-        self.io_channels.borrow_mut().clear();
-
-        // Drain run queue and drop tasks
+        // Drain run queue
         self.runq.borrow_mut().clear();
 
         unsafe {
             c::spdk_poller_unregister(&mut (self.poller.get() as *mut _));
         }
-    }
 
-    pub fn set_io_channel(&self, rawbdev: RawBdevHandle, ch: RcBdevIoChannel) {
-        self.io_channels
-            .borrow_mut()
-            .insert(BdevId(rawbdev.as_ptr() as usize), RefCell::new(ch));
+        // Remove from TCB_REGISTRY
+        let mut map = tcb_registry().write();
+        let thread_key = ThreadKey::from_thread(thread);
+        let _ = map.remove(&thread_key).expect("TCB not found in registry");
     }
+}
 
-    pub fn io_channel(&self, io: &BdevIo) -> Option<RcBdevIoChannel> {
-        self.io_channels
-            .borrow()
-            .get(&io.bdev_id())
-            .map(|ch| ch.borrow().clone())
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        self.tls.clear_all();
     }
 }
 

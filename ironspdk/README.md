@@ -1,5 +1,8 @@
 # ironspdk
 
+[![CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)
+![License](https://img.shields.io/crates/l/ironspdk?style=flat-square)
+
 Rust runtime for SPDK. Write high-performance usermode storage drivers in Rust.
 
 A cutting-edge Rust runtime that brings the power of modern async/await to SPDK (Storage Performance Development Kit). Build block devices and storage modules with the safety and productivity of Rust, while maintaining C-level performance.
@@ -29,7 +32,7 @@ A cutting-edge Rust runtime that brings the power of modern async/await to SPDK 
 
 ### 🔀 Comprehensive I/O Abstractions
 * **Multiple I/O models**: Support for I/O references (`IoRef`), buffered I/O (`IoBuf`), and unified `Io` enum
-* **I/O splitting**: Advanced utilities for splitting and reordering I/O operations
+* **I/O splitting**: Advanced API for splitting and reordering I/O operations
 * **DMA buffers**: First-class support for aligned DMA memory allocation and management
 * **Block device abstraction**: Simple trait-based interface for implementing custom block devices
 
@@ -77,7 +80,10 @@ ironspdk = "0.1"
 Simplified code of `ironspdk` block device:
 
 ```rust
-use ironspdk::{Bdev, BdevIoChannel, BdevIo, IoType, SpdkThread, RawBdevHandle};
+use ironspdk::{
+    Bdev, BdevIoChannel, BdevIoChannelRef, BdevIo, IoType, SpdkThread,
+    RawBdevHandle
+};
 
 struct MyBdevIoChannel {
     // I/O channel state (per-io_device-and-spdk_thread)
@@ -88,7 +94,7 @@ struct MyBdev {
 }
 
 impl Bdev for MyBdev {
-    fn init(&self, ctx: RawBdevHandle) {
+    fn init(&self, rawbdev: RawBdevHandle) {
         // Initialize your block device
     }
 
@@ -101,7 +107,7 @@ impl Bdev for MyBdev {
         Box::new(BdevIoChannel::new(MyBdevIoChannel {}))
     }
 
-    fn submit_io(&self, ch: &mut BdevIoChannel, io: BdevIo) {
+    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
         // Handle I/O requests asynchronously
         SpdkThread::current().spawn(async move {
             // Process I/O...
@@ -118,10 +124,12 @@ See `examples/` for exact implementations.
 ```bash
 # Set up environment
 export SPDK=/path/to/built/spdk
-export PKG_CONFIG_PATH=$SPDK/build/lib/pkgconfig/
+
+# Or use local SPDK git submodule dependency
+git submodule update --init --recursive # actualize SPDK dependency
 
 # Build
-cargo build --release
+make release
 
 # Run with specific CPU cores (0xf = cores 0-3)
 sudo RUST_LOG=info ./target/release/your_app -m 0xf
@@ -132,11 +140,11 @@ sudo RUST_LOG=info ./target/release/your_app -m 0xf
 ### RAID1 Block Device
 
 The repository includes a simple yet functional RAID1 implementation (`examples/raid1/`). This example demonstrates:
-- Mirroring I/O across two backend block devices
+- Mirroring I/O across several backend block devices
 - Handling read/write operations
 - RPC-based management interface
 
-**Compare with SPDK's C implementation `raid1.c`**: The Rust version is significantly more concise and readable, while maintaining identical performance.
+**Compare with SPDK's C implementation `raid1.c`**: The Rust version is significantly more concise and readable, while maintaining almost identical performance.
 
 #### Running the RAID1 Example
 
@@ -144,8 +152,7 @@ The repository includes a simple yet functional RAID1 implementation (`examples/
 # Terminal 1: Start the RAID1 driver
 cd ironspdk
 SPDK=/path/to/built/spdk/
-PKG_CONFIG_PATH=$SPDK/build/lib/pkgconfig/
-cargo build --release
+make release
 # run RAID1 usermode driver example at 4 CPU cores
 sudo RUST_LOG=info ./target/release/raid1 -m 0xf
 
@@ -154,11 +161,12 @@ SPDK=/path/to/built/spdk/
 cd $SPDK
 sudo ./scripts/rpc.py bdev_malloc_create -b malloc0 64 512
 sudo ./scripts/rpc.py bdev_malloc_create -b malloc1 64 512
+sudo ./scripts/rpc.py bdev_malloc_create -b malloc2 64 512
 
 # Create RAID1 instance
 sudo PYTHONPATH=/path/to/ironspdk/examples/raid1/ ./scripts/rpc.py \
     --plugin raid1 \
-    rs_raid1_create --name my_ironspdk_raid1 -c malloc0,malloc1
+    rs_raid1_create --name my_ironspdk_raid1 -c malloc0,malloc1,malloc2
 
 # Export via ublk and benchmark with fio
 sudo modprobe ublk_drv
@@ -175,6 +183,7 @@ sudo fio --filename=/dev/ublkb1 --direct=1 --numjobs=$(nproc) \
 sudo ./scripts/rpc.py ublk_stop_disk 1
 sudo PYTHONPATH=/path/to/ironspdk/ ./scripts/rpc.py \
     --plugin ironspdk rs_bdev_delete my_ironspdk_raid1
+sudo ./scripts/rpc.py bdev_malloc_delete malloc2
 sudo ./scripts/rpc.py bdev_malloc_delete malloc1
 sudo ./scripts/rpc.py bdev_malloc_delete malloc0
 ```
@@ -248,7 +257,7 @@ pub enum Io<'a> {
 impl<'a> Io<'a> {
     pub fn iter_iov(&self) -> IoIter;                    // Iterate over buffers
     pub fn iter_iov_mut(&mut self) -> IoIterMut;         // Mutable iteration
-    pub fn split(&'a self, child_block_len: Option<usize>) 
+    pub fn split(&'a self, child_block_len: Option<usize>)
         -> Result<IoRefSplitter<'a>, Error>;             // Split I/O operations
     pub fn offset_blocks(&self) -> u64;
     pub fn num_blocks(&self) -> usize;
@@ -256,16 +265,19 @@ impl<'a> Io<'a> {
 ```
 
 #### `DmaBuf`
-DMA-allocated memory buffer with Send+Sync support for thread-safe sharing.
+DMA-allocated memory buffer.
+It may be shared between threads, so it implements Send+Sync+Clone.
 
 ```rust
 pub struct DmaBuf { /* ... */ }
 
 impl DmaBuf {
     pub fn new(len: usize, align: usize) -> Result<Self, Error>;
+    pub fn new_aligned(len: usize, align: usize) -> Result<Self, Error>;
+    pub fn new_zeroed(len: usize) -> Result<Self, Error>;
+    pub fn new_aligned_zeroed(len: usize, align: usize) -> Result<Self, Error>;
     pub fn as_slice(&self) -> &[u8];
-    pub fn as_mut_slice(&mut self) -> Result<&mut [u8], Error>;
-    pub unsafe fn as_mut_slice_unchecked(&self) -> &mut [u8];
+    pub fn as_mut_slice(&mut self) -> &mut [u8];
 }
 ```
 
@@ -341,8 +353,6 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-- [ ] More public API documentation
-- [ ] Documentation at docs.rs
 - [ ] Test coverage (cargo test)
 - [ ] Additional block device examples (encryption, RAID5)
 - [ ] T10 PI (DIF/DIX) support
