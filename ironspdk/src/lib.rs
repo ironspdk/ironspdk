@@ -941,7 +941,8 @@ impl BdevIoChannel {
 /// # Usage
 ///
 /// ```no_run
-/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoType, SpdkThread};
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoType,
+///                RawBdevHandle, SpdkThread};
 /// use std::os::raw::c_void;
 /// use std::ptr::NonNull;
 ///
@@ -949,8 +950,8 @@ impl BdevIoChannel {
 /// struct MyBdev;
 ///
 /// impl Bdev for MyBdev {
-///     fn init(&self, _: NonNull<c_void>) { todo!() }
-///     fn io_type_supported(&self, _: IoType) -> bool { todo!() }
+///     fn init(&self, rawbdev: RawBdevHandle) { todo!() }
+///     fn io_type_supported(&self, io_type: IoType) -> bool { todo!() }
 ///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
 ///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
 ///         // ... process I/O ...
@@ -1097,15 +1098,16 @@ impl RcBdevIoChannel {
 /// [`BdevIo::complete_on`] with the appropriate [`IoStatus`]:
 ///
 /// ```no_run
-/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoStatus, IoType};
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoStatus,
+///                IoType, RawBdevHandle};
 /// use std::os::raw::c_void;
 /// use std::ptr::NonNull;
 ///
 /// struct MyBdev;
 ///
 /// impl Bdev for MyBdev {
-///     fn init(&self, _: NonNull<c_void>) { todo!() }
-///     fn io_type_supported(&self, _: IoType) -> bool { todo!() }
+///     fn init(&self, rawbdev: RawBdevHandle) { todo!() }
+///     fn io_type_supported(&self, io_type: IoType) -> bool { todo!() }
 ///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
 ///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
 ///         // Perform the operation...
@@ -1435,7 +1437,7 @@ impl Drop for CpuSet {
     }
 }
 
-/// SPDK thread wrapper.
+/// SPDK thread thin wrapper around `struct spdk_thread`.
 /// Represents an SPDK lightweight thread with its associated reactor.
 ///
 /// SPDK uses a thread-per-core model where each thread has its own
@@ -1590,7 +1592,6 @@ impl SpdkThread {
 
 pub const TLS_SLOTS: usize = 4;
 
-///
 /// SPDK TLS interface
 ///
 /// It introduces SPDK TLS (which is not present in native SPDK)
@@ -1600,22 +1601,39 @@ pub const TLS_SLOTS: usize = 4;
 /// SPDK TLS is cheap: takes one cache line of memory and
 /// O(1) of time at loading/storing.
 ///
-/// SAFETY: The code of TlsKey::new() and TlsKey::alloc() panics if key slot
+/// # SAFETY
+///
+/// The code of TlsKey::new() and TlsKey::alloc() panics if key slot
 /// count exceeds TLS_SLOTS. This in intentional: SPDK TLS is a limited resource
 /// and should not be wasted.
 ///
-/// Usage example:
-///    let my_type_tls = TlsKey<MyType>::alloc(); // allocate the key at free slot
-///    my_type_tls.set(MyType {...});
-///    let val = my_type_tls.get()?;
+/// # Examples
 ///
-/// or
+/// ```no_run
+/// use ironspdk::TlsKey;
 ///
-///    static MY_TYPE_TLS = TlsKey<MyType>::new(0); // explicitly take a slot with index 0
-///    ...
-///    MY_TYPE_TLS.set(MyType {...});
-///    let val = MY_TYPE_TLS.get()?;
+/// struct MyIoChannel;
 ///
+/// fn my_ioch_set_and_get() {
+///    // allocate the key at free slot
+///    let my_ioch_tls: TlsKey<MyIoChannel> = TlsKey::alloc();
+///    my_ioch_tls.set(MyIoChannel {});
+///    let val = my_ioch_tls.get().expect("TLS value mut be set");
+/// }
+/// ```
+///
+/// ```no_run
+/// use ironspdk::TlsKey;
+///
+/// struct MyIoChannel;
+///
+/// // explicitly take a slot with index 0
+/// static MY_IOCH_TLS: TlsKey<MyIoChannel> = TlsKey::new(0);
+/// fn my_ioch_set_and_get() {
+///    MY_IOCH_TLS.set(MyIoChannel {});
+///    let val = MY_IOCH_TLS.get().expect("TLS value mut be set");
+/// }
+/// ```
 pub struct TlsKey<T: 'static> {
     slot: usize,
     _marker: PhantomData<fn() -> T>,
@@ -2043,7 +2061,7 @@ impl IoFuture {
 
 // *** Client code for lower-layer bdevs ***
 
-/// Thin wrapper around 'struct spdk_bdev_desc'
+/// Thin wrapper around `struct spdk_bdev_desc`
 #[derive(Clone, Debug)]
 pub struct BdevDesc {
     raw: NonNull<c::spdk_bdev_desc>,
