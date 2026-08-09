@@ -523,11 +523,7 @@ pub struct IoRefSplitter<'a> {
     cursor_bytes: usize,
 }
 
-fn slice_iovs(
-    iovs: &[c::iovec],
-    mut offset: usize,
-    mut len: usize,
-) -> Result<Iovecs, Error> {
+fn slice_iovs(iovs: &[c::iovec], mut offset: usize, mut len: usize) -> Result<Iovecs, Error> {
     let mut result: Iovecs = Iovecs::new();
     for iov in iovs {
         if offset >= iov.iov_len {
