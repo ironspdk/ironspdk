@@ -53,6 +53,7 @@ use log::{debug, error, warn};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use parking_lot::{Mutex, RwLock};
 use paste::paste;
+use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::min;
@@ -310,6 +311,10 @@ impl DmaBuf {
     }
 }
 
+// Performance tests shows SmallVec<[c::iovec; 2]> is slightly
+// faster (~= 0.7%) than Vec<c::iovec>
+type Iovecs = SmallVec<[c::iovec; 2]>;
+
 /// A zero-copy view of an SPDK bdev I/O request.
 ///
 /// `IoRef` describes the data buffers belonging to an existing
@@ -343,7 +348,7 @@ impl DmaBuf {
 #[derive(Debug)]
 pub struct IoRef<'a> {
     /// Scatter-gather list
-    data_iovs: Vec<c::iovec>,
+    data_iovs: Iovecs,
     /// Logical block address (LBA)
     offset_blocks: u64,
     /// Offset in parent IoRef (in blocks), zero for parent
@@ -394,7 +399,7 @@ impl<'a> IoRef<'a> {
         let offset_blocks = parent_offset_blocks * (parent_block_len as u64) / (block_len as u64);
 
         Ok(Self {
-            data_iovs: data_iovs.to_vec(),
+            data_iovs: SmallVec::from_slice(data_iovs),
             offset_blocks,
             ref_offset: 0usize,
             num_blocks,
@@ -522,8 +527,8 @@ fn slice_iovs(
     iovs: &[c::iovec],
     mut offset: usize,
     mut len: usize,
-) -> Result<Vec<c::iovec>, Error> {
-    let mut result = Vec::new();
+) -> Result<Iovecs, Error> {
+    let mut result: Iovecs = Iovecs::new();
     for iov in iovs {
         if offset >= iov.iov_len {
             offset -= iov.iov_len;
@@ -2120,7 +2125,7 @@ impl LbdevIoChannel {
 }
 
 pub struct LbdevIoCtx {
-    iovs: Vec<c::iovec>,
+    iovs: Iovecs, //Vec<c::iovec>,
     result: Rc<LbdevIoResult>,
 }
 
@@ -2187,7 +2192,7 @@ impl Lbdev {
     }
 
     pub fn read(&self, ch: &LbdevIoChannel, mut io: Io) -> Rc<LbdevIoResult> {
-        let mut iovs_c: Vec<c::iovec> = Vec::new();
+        let mut iovs_c: Iovecs = Iovecs::new();
         for iov_slice in io.iter_iov_mut() {
             let iov_c = c::iovec {
                 iov_base: iov_slice.as_mut_ptr() as *mut _,
@@ -2235,7 +2240,7 @@ impl Lbdev {
     }
 
     pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        let mut iovs_c: Vec<c::iovec> = Vec::new();
+        let mut iovs_c: Iovecs = Iovecs::new();
         for iov_slice in io.iter_iov() {
             let iov_c = c::iovec {
                 iov_base: iov_slice.as_ptr() as *mut _,
