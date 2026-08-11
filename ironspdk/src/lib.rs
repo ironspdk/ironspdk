@@ -311,7 +311,7 @@ impl DmaBuf {
     }
 }
 
-// Performance tests shows SmallVec<[c::iovec; 2]> is slightly
+// Performance tests show SmallVec<[c::iovec; 2]> is slightly
 // faster (~= 0.7%) than Vec<c::iovec>
 type Iovecs = SmallVec<[c::iovec; 2]>;
 
