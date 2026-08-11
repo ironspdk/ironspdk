@@ -198,21 +198,6 @@ c_enum! {
     }
 }
 
-#[derive(Debug)]
-struct DmaBufInner {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-unsafe impl Send for DmaBufInner {}
-unsafe impl Sync for DmaBufInner {}
-
-impl Drop for DmaBufInner {
-    fn drop(&mut self) {
-        unsafe { c::spdk_dma_free(self.ptr.as_ptr() as *mut _) }
-    }
-}
-
 /// A buffer allocated from DMA-capable memory.
 ///
 /// `DmaBuf` owns the underlying allocation and releases it with
@@ -220,16 +205,9 @@ impl Drop for DmaBufInner {
 /// allocation is suitable for I/O operations that require DMA-accessible
 /// memory.
 ///
-/// A `DmaBuf` can be cloned. Cloning shares ownership of the same allocation;
-/// it does not copy the contents of the buffer. Consequently, all clones
-/// refer to the same memory.
-///
 /// The buffer can be accessed as a byte slice with [`as_slice`](Self::as_slice)
 /// or [`as_mut_slice`](Self::as_mut_slice). Mutable access follows the usual
-/// Rust borrowing rules for a particular `DmaBuf`, but clones refer to the
-/// same underlying allocation, so callers must ensure that concurrent access
-/// through multiple clones does not violate the requirements of the operation
-/// using the buffer.
+/// Rust borrowing rules for a particular `DmaBuf`. Clones are not allowed.
 ///
 /// # Examples
 ///
@@ -254,7 +232,17 @@ impl Drop for DmaBufInner {
 /// requested memory.
 #[derive(Debug)]
 pub struct DmaBuf {
-    inner: DmaBufInner,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for DmaBuf {}
+unsafe impl Sync for DmaBuf {}
+
+impl Drop for DmaBuf {
+    fn drop(&mut self) {
+        unsafe { c::spdk_dma_free(self.ptr.as_ptr() as *mut _) }
+    }
 }
 
 impl DmaBuf {
@@ -288,26 +276,24 @@ impl DmaBuf {
             unsafe { c::spdk_dma_malloc(len, align, std::ptr::null_mut()) }
         };
         let ptr = NonNull::new(ptr as *mut u8).ok_or(Error::NoMemory)?;
-        Ok(Self {
-            inner: DmaBufInner { ptr, len },
-        })
+        Ok(Self { ptr, len })
     }
 
     /// Returns the length of the buffer in bytes.
     pub fn len(&self) -> usize {
-        self.inner.len
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.len == 0
+        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) }
+        unsafe { from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.len) }
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
