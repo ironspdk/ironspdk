@@ -77,9 +77,9 @@ examples/raid1/        # Simple RAID1 implementation example
 ### Runtime Executor
 
 The `ironspdk` runtime leverages SPDK's poller mechanism:
-- **Thread Control Block (Tcb)**: Manages async task execution on each SPDK thread
-- **Task scheduler**: Queues and polls futures
-- **I/O channel management**: Tracks and manages block device I/O channels per thread
+- **Run queue**: Manages async task execution on each SPDK thread
+- **Poller**: Queues and polls futures
+- **TLS**: Lightweight per SPDK thread storage (to store contexts, for ex. I/O channels)
 - **Waker integration**: Custom waker implementation to notify tasks in runqueue
 
 ## Usage
@@ -247,7 +247,7 @@ pub trait Bdev {
     fn init(&self, ctx: RawBdevHandle);
     fn io_type_supported(&self, io_type: IoType) -> bool;
     fn create_io_channel(&self) -> Box<BdevIoChannel>;
-    fn submit_io(&self, ch: &mut BdevIoChannel, io: BdevIo);
+    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo);
 }
 ```
 
@@ -289,7 +289,7 @@ impl<'a> Io<'a> {
 
 #### `DmaBuf`
 DMA-allocated memory buffer.
-It may be shared between threads, so it implements Send+Sync+Clone.
+It may be shared between threads, so it implements Send+Sync.
 
 ```rust
 pub struct DmaBuf { /* ... */ }

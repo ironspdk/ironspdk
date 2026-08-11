@@ -198,21 +198,6 @@ c_enum! {
     }
 }
 
-#[derive(Debug)]
-struct DmaBufInner {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-unsafe impl Send for DmaBufInner {}
-unsafe impl Sync for DmaBufInner {}
-
-impl Drop for DmaBufInner {
-    fn drop(&mut self) {
-        unsafe { c::spdk_dma_free(self.ptr.as_ptr() as *mut _) }
-    }
-}
-
 /// A buffer allocated from DMA-capable memory.
 ///
 /// `DmaBuf` owns the underlying allocation and releases it with
@@ -220,16 +205,9 @@ impl Drop for DmaBufInner {
 /// allocation is suitable for I/O operations that require DMA-accessible
 /// memory.
 ///
-/// A `DmaBuf` can be cloned. Cloning shares ownership of the same allocation;
-/// it does not copy the contents of the buffer. Consequently, all clones
-/// refer to the same memory.
-///
 /// The buffer can be accessed as a byte slice with [`as_slice`](Self::as_slice)
 /// or [`as_mut_slice`](Self::as_mut_slice). Mutable access follows the usual
-/// Rust borrowing rules for a particular `DmaBuf`, but clones refer to the
-/// same underlying allocation, so callers must ensure that concurrent access
-/// through multiple clones does not violate the requirements of the operation
-/// using the buffer.
+/// Rust borrowing rules for a particular `DmaBuf`. Clones are not allowed.
 ///
 /// # Examples
 ///
@@ -254,7 +232,17 @@ impl Drop for DmaBufInner {
 /// requested memory.
 #[derive(Debug)]
 pub struct DmaBuf {
-    inner: DmaBufInner,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for DmaBuf {}
+unsafe impl Sync for DmaBuf {}
+
+impl Drop for DmaBuf {
+    fn drop(&mut self) {
+        unsafe { c::spdk_dma_free(self.ptr.as_ptr() as *mut _) }
+    }
 }
 
 impl DmaBuf {
@@ -288,30 +276,28 @@ impl DmaBuf {
             unsafe { c::spdk_dma_malloc(len, align, std::ptr::null_mut()) }
         };
         let ptr = NonNull::new(ptr as *mut u8).ok_or(Error::NoMemory)?;
-        Ok(Self {
-            inner: DmaBufInner { ptr, len },
-        })
+        Ok(Self { ptr, len })
     }
 
     /// Returns the length of the buffer in bytes.
     pub fn len(&self) -> usize {
-        self.inner.len
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.len == 0
+        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) }
+        unsafe { from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.len) }
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-// Performance tests shows SmallVec<[c::iovec; 2]> is slightly
+// Performance tests show SmallVec<[c::iovec; 2]> is slightly
 // faster (~= 0.7%) than Vec<c::iovec>
 type Iovecs = SmallVec<[c::iovec; 2]>;
 
@@ -414,6 +400,10 @@ impl<'a> IoRef<'a> {
         self.offset_blocks = offset_blocks;
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
     /// Returns the total number of bytes in the I/O reference.
     pub fn total_bytes(&self) -> usize {
         self.num_blocks * self.block_len
@@ -467,6 +457,10 @@ impl IoBuf {
         })
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.num_blocks * self.block_len
     }
@@ -516,6 +510,49 @@ impl<'a> Iterator for IoIterMut<'a> {
     }
 }
 
+/// A sequential splitter for a zero-copy [`IoRef`].
+///
+/// `IoRefSplitter` divides an [`IoRef`] into a sequence of smaller [`IoRef`]s.
+/// Each child refers to a consecutive portion of the parent's data; no data is
+/// copied. The splitter maintains an internal cursor and [`take`](Self::take)
+/// advances that cursor after successfully creating a child.
+///
+/// The child block length is specified when the splitter is created. If no
+/// child block length is specified, the parent's block length is used. Each
+/// call to [`take`](Self::take) then consumes the requested number of child
+/// blocks from the current position.
+///
+/// Splitting operates on the byte range covered by the parent I/O rather than
+/// on its individual I/O vectors. Consequently, a child may begin or end in
+/// the middle of an [`iovec`]. The resulting child still references the
+/// original memory and preserves the parent's scatter/gather layout for the
+/// portion it covers.
+///
+/// The splitter borrows the parent [`IoRef`] for its entire lifetime, and all
+/// child [`IoRef`]s returned by [`take`](Self::take) retain the same underlying
+/// lifetime. The parent must therefore remain valid while the splitter and
+/// its children are in use.
+///
+/// `IoRefSplitter` is intended for cases where a larger I/O request must be
+/// processed as a sequence of smaller requests, such as dividing a request
+/// into device-specific blocks or RAID stripes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ironspdk::{Io, IoRefSplitter};
+///
+/// fn split_io(io: &Io) -> Result<(), ironspdk::Error> {
+///     let mut splitter = io.split(Some(4096))?;
+///
+///     let first = splitter.take(1)?;
+///     let second = splitter.take(2)?;
+///
+///     assert_eq!(first.num_blocks(), 1);
+///     assert_eq!(second.num_blocks(), 2);
+///     Ok(())
+/// }
+/// ```
 pub struct IoRefSplitter<'a> {
     parent_iovs: &'a [c::iovec],
     parent_total_bytes: usize,
@@ -560,6 +597,25 @@ impl<'a> IoRefSplitter<'a> {
         }
     }
 
+    /// Takes the next `blocks` blocks from the splitter.
+    ///
+    /// The returned [`IoRef`] refers to the next consecutive portion of the
+    /// parent's data. No data is copied. The splitter advances its cursor only
+    /// after successfully creating the child.
+    ///
+    /// `blocks` is measured in the child block size specified when the splitter
+    /// was created. The requested range must fit entirely within the remaining
+    /// portion of the parent I/O.
+    ///
+    /// The returned reference has the requested child block size and a
+    /// `ref_offset` identifying its position within the parent. Its
+    /// `offset_blocks` is initialized to zero; callers that need a logical LBA
+    /// must set it explicitly, typically using [`IoRef::update_offset_blocks`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfRange`] if the requested range extends beyond the
+    /// remaining data in the parent I/O.
     pub fn take(&mut self, blocks: usize) -> Result<IoRef<'a>, Error> {
         let bytes = blocks * self.child_block_len;
         if self.cursor_bytes + bytes > self.parent_total_bytes {
