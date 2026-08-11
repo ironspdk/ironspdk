@@ -400,6 +400,10 @@ impl<'a> IoRef<'a> {
         self.offset_blocks = offset_blocks;
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
     /// Returns the total number of bytes in the I/O reference.
     pub fn total_bytes(&self) -> usize {
         self.num_blocks * self.block_len
@@ -453,6 +457,10 @@ impl IoBuf {
         })
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.num_blocks * self.block_len
     }
@@ -502,6 +510,49 @@ impl<'a> Iterator for IoIterMut<'a> {
     }
 }
 
+/// A sequential splitter for a zero-copy [`IoRef`].
+///
+/// `IoRefSplitter` divides an [`IoRef`] into a sequence of smaller [`IoRef`]s.
+/// Each child refers to a consecutive portion of the parent's data; no data is
+/// copied. The splitter maintains an internal cursor and [`take`](Self::take)
+/// advances that cursor after successfully creating a child.
+///
+/// The child block length is specified when the splitter is created. If no
+/// child block length is specified, the parent's block length is used. Each
+/// call to [`take`](Self::take) then consumes the requested number of child
+/// blocks from the current position.
+///
+/// Splitting operates on the byte range covered by the parent I/O rather than
+/// on its individual I/O vectors. Consequently, a child may begin or end in
+/// the middle of an [`iovec`]. The resulting child still references the
+/// original memory and preserves the parent's scatter/gather layout for the
+/// portion it covers.
+///
+/// The splitter borrows the parent [`IoRef`] for its entire lifetime, and all
+/// child [`IoRef`]s returned by [`take`](Self::take) retain the same underlying
+/// lifetime. The parent must therefore remain valid while the splitter and
+/// its children are in use.
+///
+/// `IoRefSplitter` is intended for cases where a larger I/O request must be
+/// processed as a sequence of smaller requests, such as dividing a request
+/// into device-specific blocks or RAID stripes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ironspdk::{Io, IoRefSplitter};
+///
+/// fn split_io(io: &Io) -> Result<(), ironspdk::Error> {
+///     let mut splitter = io.split(Some(4096))?;
+///
+///     let first = splitter.take(1)?;
+///     let second = splitter.take(2)?;
+///
+///     assert_eq!(first.num_blocks(), 1);
+///     assert_eq!(second.num_blocks(), 2);
+///     Ok(())
+/// }
+/// ```
 pub struct IoRefSplitter<'a> {
     parent_iovs: &'a [c::iovec],
     parent_total_bytes: usize,
@@ -550,6 +601,25 @@ impl<'a> IoRefSplitter<'a> {
         }
     }
 
+    /// Takes the next `blocks` blocks from the splitter.
+    ///
+    /// The returned [`IoRef`] refers to the next consecutive portion of the
+    /// parent's data. No data is copied. The splitter advances its cursor only
+    /// after successfully creating the child.
+    ///
+    /// `blocks` is measured in the child block size specified when the splitter
+    /// was created. The requested range must fit entirely within the remaining
+    /// portion of the parent I/O.
+    ///
+    /// The returned reference has the requested child block size and a
+    /// `ref_offset` identifying its position within the parent. Its
+    /// `offset_blocks` is initialized to zero; callers that need a logical LBA
+    /// must set it explicitly, typically using [`IoRef::update_offset_blocks`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfRange`] if the requested range extends beyond the
+    /// remaining data in the parent I/O.
     pub fn take(&mut self, blocks: usize) -> Result<IoRef<'a>, Error> {
         let bytes = blocks * self.child_block_len;
         if self.cursor_bytes + bytes > self.parent_total_bytes {
