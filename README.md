@@ -289,7 +289,7 @@ impl<'a> Io<'a> {
 
 #### `DmaBuf`
 DMA-allocated memory buffer.
-It may be shared between threads, so it implements Send+Sync+Clone.
+It may be shared between threads, so it implements Send+Sync.
 
 ```rust
 pub struct DmaBuf { /* ... */ }
