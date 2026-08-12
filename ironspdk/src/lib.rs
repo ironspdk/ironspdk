@@ -723,7 +723,6 @@ impl<'a> Io<'a> {
         }
     }
 
-
     /// Returns an iterator over the data buffers of the I/O.
     ///
     /// For [`Io::Ref`], the iterator yields one slice for each scatter/gather
