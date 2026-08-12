@@ -727,9 +727,17 @@ impl<'a> Io<'a> {
         }
     }
 
-    /// Returns an iterator over I/O vectors.
+
+    /// Returns an iterator over the data buffers of the I/O.
     ///
-    /// This iterator yields slices for each I/O vector in the operation.
+    /// For [`Io::Ref`], the iterator yields one slice for each scatter/gather
+    /// I/O vector.
+    ///
+    /// For [`Io::Buf`], which owns a contiguous [`DmaBuf`], the
+    /// iterator yields a single slice containing the entire buffer.
+    ///
+    /// The returned slices cover the data associated with the I/O; their total
+    /// length is equal to [`Io::total_bytes`](Self::total_bytes).
     ///
     /// # Examples
     ///
@@ -739,8 +747,11 @@ impl<'a> Io<'a> {
     /// fn count_total_bytes(io: &Io) -> Result<usize, Error> {
     ///     let buf = DmaBuf::new(1024)?;
     ///     let io = Io::new_buf(buf, 0, 512)?;
+    ///
+    ///     // The buffer contains two 512-byte blocks, so the I/O is 1024 bytes.
     ///     let total: usize = io.iter_iov().map(|s| s.len()).sum();
-    ///     assert_eq!(total, 1024);
+    ///     assert_eq!(total, io.num_blocks() * 512);
+    ///
     ///     Ok(total)
     /// }
     /// ```
