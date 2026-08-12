@@ -1,6 +1,6 @@
 [package]
 name = "ironspdk"
-version = "0.1.8"
+version = "0.1.11"
 authors = ["Eugene Korenevsky <ekorenevsky@aliyun.com>"]
 license = "Apache-2.0 OR BSD-3-Clause"
 repository = "https://github.com/ironspdk/ironspdk"
@@ -15,4 +15,5 @@ num_enum = "0.7.5"
 parking_lot = "0.12.5"
 paste = "1.0.15"
 serde_json = "1.0.149"
+smallvec = "1.15.2"
 thiserror = "2.0.17"

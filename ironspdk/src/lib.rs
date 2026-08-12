@@ -53,6 +53,7 @@ use log::{debug, error, warn};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use parking_lot::{Mutex, RwLock};
 use paste::paste;
+use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::min;
@@ -197,21 +198,6 @@ c_enum! {
     }
 }
 
-#[derive(Debug)]
-struct DmaBufInner {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-unsafe impl Send for DmaBufInner {}
-unsafe impl Sync for DmaBufInner {}
-
-impl Drop for DmaBufInner {
-    fn drop(&mut self) {
-        unsafe { c::spdk_dma_free(self.ptr.as_ptr() as *mut _) }
-    }
-}
-
 /// A buffer allocated from DMA-capable memory.
 ///
 /// `DmaBuf` owns the underlying allocation and releases it with
@@ -219,16 +205,9 @@ impl Drop for DmaBufInner {
 /// allocation is suitable for I/O operations that require DMA-accessible
 /// memory.
 ///
-/// A `DmaBuf` can be cloned. Cloning shares ownership of the same allocation;
-/// it does not copy the contents of the buffer. Consequently, all clones
-/// refer to the same memory.
-///
 /// The buffer can be accessed as a byte slice with [`as_slice`](Self::as_slice)
 /// or [`as_mut_slice`](Self::as_mut_slice). Mutable access follows the usual
-/// Rust borrowing rules for a particular `DmaBuf`, but clones refer to the
-/// same underlying allocation, so callers must ensure that concurrent access
-/// through multiple clones does not violate the requirements of the operation
-/// using the buffer.
+/// Rust borrowing rules for a particular `DmaBuf`. Clones are not allowed.
 ///
 /// # Examples
 ///
@@ -253,7 +232,17 @@ impl Drop for DmaBufInner {
 /// requested memory.
 #[derive(Debug)]
 pub struct DmaBuf {
-    inner: DmaBufInner,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for DmaBuf {}
+unsafe impl Sync for DmaBuf {}
+
+impl Drop for DmaBuf {
+    fn drop(&mut self) {
+        unsafe { c::spdk_dma_free(self.ptr.as_ptr() as *mut _) }
+    }
 }
 
 impl DmaBuf {
@@ -287,28 +276,30 @@ impl DmaBuf {
             unsafe { c::spdk_dma_malloc(len, align, std::ptr::null_mut()) }
         };
         let ptr = NonNull::new(ptr as *mut u8).ok_or(Error::NoMemory)?;
-        Ok(Self {
-            inner: DmaBufInner { ptr, len },
-        })
+        Ok(Self { ptr, len })
     }
 
     /// Returns the length of the buffer in bytes.
     pub fn len(&self) -> usize {
-        self.inner.len
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.len == 0
+        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) }
+        unsafe { from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.len) }
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
+
+// Performance tests show SmallVec<[c::iovec; 2]> is slightly
+// faster (~= 0.7%) than Vec<c::iovec>
+type Iovecs = SmallVec<[c::iovec; 2]>;
 
 /// A zero-copy view of an SPDK bdev I/O request.
 ///
@@ -343,7 +334,7 @@ impl DmaBuf {
 #[derive(Debug)]
 pub struct IoRef<'a> {
     /// Scatter-gather list
-    data_iovs: Vec<c::iovec>,
+    data_iovs: Iovecs,
     /// Logical block address (LBA)
     offset_blocks: u64,
     /// Offset in parent IoRef (in blocks), zero for parent
@@ -394,7 +385,7 @@ impl<'a> IoRef<'a> {
         let offset_blocks = parent_offset_blocks * (parent_block_len as u64) / (block_len as u64);
 
         Ok(Self {
-            data_iovs: data_iovs.to_vec(),
+            data_iovs: SmallVec::from_slice(data_iovs),
             offset_blocks,
             ref_offset: 0usize,
             num_blocks,
@@ -407,6 +398,10 @@ impl<'a> IoRef<'a> {
     /// This method is useful when splitting or reordering I/O operations.
     pub fn update_offset_blocks(&mut self, offset_blocks: u64) {
         self.offset_blocks = offset_blocks;
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
     }
 
     /// Returns the total number of bytes in the I/O reference.
@@ -462,6 +457,10 @@ impl IoBuf {
         })
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.num_blocks * self.block_len
     }
@@ -511,6 +510,49 @@ impl<'a> Iterator for IoIterMut<'a> {
     }
 }
 
+/// A sequential splitter for a zero-copy [`IoRef`].
+///
+/// `IoRefSplitter` divides an [`IoRef`] into a sequence of smaller [`IoRef`]s.
+/// Each child refers to a consecutive portion of the parent's data; no data is
+/// copied. The splitter maintains an internal cursor and [`take`](Self::take)
+/// advances that cursor after successfully creating a child.
+///
+/// The child block length is specified when the splitter is created. If no
+/// child block length is specified, the parent's block length is used. Each
+/// call to [`take`](Self::take) then consumes the requested number of child
+/// blocks from the current position.
+///
+/// Splitting operates on the byte range covered by the parent I/O rather than
+/// on its individual I/O vectors. Consequently, a child may begin or end in
+/// the middle of an [`iovec`]. The resulting child still references the
+/// original memory and preserves the parent's scatter/gather layout for the
+/// portion it covers.
+///
+/// The splitter borrows the parent [`IoRef`] for its entire lifetime, and all
+/// child [`IoRef`]s returned by [`take`](Self::take) retain the same underlying
+/// lifetime. The parent must therefore remain valid while the splitter and
+/// its children are in use.
+///
+/// `IoRefSplitter` is intended for cases where a larger I/O request must be
+/// processed as a sequence of smaller requests, such as dividing a request
+/// into device-specific blocks or RAID stripes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ironspdk::{Io, IoRefSplitter};
+///
+/// fn split_io(io: &Io) -> Result<(), ironspdk::Error> {
+///     let mut splitter = io.split(Some(4096))?;
+///
+///     let first = splitter.take(1)?;
+///     let second = splitter.take(2)?;
+///
+///     assert_eq!(first.num_blocks(), 1);
+///     assert_eq!(second.num_blocks(), 2);
+///     Ok(())
+/// }
+/// ```
 pub struct IoRefSplitter<'a> {
     parent_iovs: &'a [c::iovec],
     parent_total_bytes: usize,
@@ -518,12 +560,8 @@ pub struct IoRefSplitter<'a> {
     cursor_bytes: usize,
 }
 
-fn slice_iovs(
-    iovs: &[c::iovec],
-    mut offset: usize,
-    mut len: usize,
-) -> Result<Vec<c::iovec>, Error> {
-    let mut result = Vec::new();
+fn slice_iovs(iovs: &[c::iovec], mut offset: usize, mut len: usize) -> Result<Iovecs, Error> {
+    let mut result: Iovecs = Iovecs::new();
     for iov in iovs {
         if offset >= iov.iov_len {
             offset -= iov.iov_len;
@@ -559,6 +597,25 @@ impl<'a> IoRefSplitter<'a> {
         }
     }
 
+    /// Takes the next `blocks` blocks from the splitter.
+    ///
+    /// The returned [`IoRef`] refers to the next consecutive portion of the
+    /// parent's data. No data is copied. The splitter advances its cursor only
+    /// after successfully creating the child.
+    ///
+    /// `blocks` is measured in the child block size specified when the splitter
+    /// was created. The requested range must fit entirely within the remaining
+    /// portion of the parent I/O.
+    ///
+    /// The returned reference has the requested child block size and a
+    /// `ref_offset` identifying its position within the parent. Its
+    /// `offset_blocks` is initialized to zero; callers that need a logical LBA
+    /// must set it explicitly, typically using [`IoRef::update_offset_blocks`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfRange`] if the requested range extends beyond the
+    /// remaining data in the parent I/O.
     pub fn take(&mut self, blocks: usize) -> Result<IoRef<'a>, Error> {
         let bytes = blocks * self.child_block_len;
         if self.cursor_bytes + bytes > self.parent_total_bytes {
@@ -666,9 +723,16 @@ impl<'a> Io<'a> {
         }
     }
 
-    /// Returns an iterator over I/O vectors.
+    /// Returns an iterator over the data buffers of the I/O.
     ///
-    /// This iterator yields slices for each I/O vector in the operation.
+    /// For [`Io::Ref`], the iterator yields one slice for each scatter/gather
+    /// I/O vector.
+    ///
+    /// For [`Io::Buf`], which owns a contiguous [`DmaBuf`], the
+    /// iterator yields a single slice containing the entire buffer.
+    ///
+    /// The returned slices cover the data associated with the I/O; their total
+    /// length is equal to [`Io::total_bytes`](Self::total_bytes).
     ///
     /// # Examples
     ///
@@ -678,8 +742,11 @@ impl<'a> Io<'a> {
     /// fn count_total_bytes(io: &Io) -> Result<usize, Error> {
     ///     let buf = DmaBuf::new(1024)?;
     ///     let io = Io::new_buf(buf, 0, 512)?;
+    ///
+    ///     // The buffer contains two 512-byte blocks, so the I/O is 1024 bytes.
     ///     let total: usize = io.iter_iov().map(|s| s.len()).sum();
-    ///     assert_eq!(total, 1024);
+    ///     assert_eq!(total, io.num_blocks() * 512);
+    ///
     ///     Ok(total)
     /// }
     /// ```
@@ -941,7 +1008,8 @@ impl BdevIoChannel {
 /// # Usage
 ///
 /// ```no_run
-/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoType, SpdkThread};
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoType,
+///                RawBdevHandle, SpdkThread};
 /// use std::os::raw::c_void;
 /// use std::ptr::NonNull;
 ///
@@ -949,8 +1017,8 @@ impl BdevIoChannel {
 /// struct MyBdev;
 ///
 /// impl Bdev for MyBdev {
-///     fn init(&self, _: NonNull<c_void>) { todo!() }
-///     fn io_type_supported(&self, _: IoType) -> bool { todo!() }
+///     fn init(&self, rawbdev: RawBdevHandle) { todo!() }
+///     fn io_type_supported(&self, io_type: IoType) -> bool { todo!() }
 ///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
 ///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
 ///         // ... process I/O ...
@@ -1097,15 +1165,16 @@ impl RcBdevIoChannel {
 /// [`BdevIo::complete_on`] with the appropriate [`IoStatus`]:
 ///
 /// ```no_run
-/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoStatus, IoType};
+/// use ironspdk::{Bdev, BdevIo, BdevIoChannel, BdevIoChannelRef, IoStatus,
+///                IoType, RawBdevHandle};
 /// use std::os::raw::c_void;
 /// use std::ptr::NonNull;
 ///
 /// struct MyBdev;
 ///
 /// impl Bdev for MyBdev {
-///     fn init(&self, _: NonNull<c_void>) { todo!() }
-///     fn io_type_supported(&self, _: IoType) -> bool { todo!() }
+///     fn init(&self, rawbdev: RawBdevHandle) { todo!() }
+///     fn io_type_supported(&self, io_type: IoType) -> bool { todo!() }
 ///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
 ///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
 ///         // Perform the operation...
@@ -1435,7 +1504,7 @@ impl Drop for CpuSet {
     }
 }
 
-/// SPDK thread wrapper.
+/// SPDK thread thin wrapper around `struct spdk_thread`.
 /// Represents an SPDK lightweight thread with its associated reactor.
 ///
 /// SPDK uses a thread-per-core model where each thread has its own
@@ -1590,7 +1659,6 @@ impl SpdkThread {
 
 pub const TLS_SLOTS: usize = 4;
 
-///
 /// SPDK TLS interface
 ///
 /// It introduces SPDK TLS (which is not present in native SPDK)
@@ -1600,22 +1668,39 @@ pub const TLS_SLOTS: usize = 4;
 /// SPDK TLS is cheap: takes one cache line of memory and
 /// O(1) of time at loading/storing.
 ///
-/// SAFETY: The code of TlsKey::new() and TlsKey::alloc() panics if key slot
+/// # SAFETY
+///
+/// The code of TlsKey::new() and TlsKey::alloc() panics if key slot
 /// count exceeds TLS_SLOTS. This in intentional: SPDK TLS is a limited resource
 /// and should not be wasted.
 ///
-/// Usage example:
-///    let my_type_tls = TlsKey<MyType>::alloc(); // allocate the key at free slot
-///    my_type_tls.set(MyType {...});
-///    let val = my_type_tls.get()?;
+/// # Examples
 ///
-/// or
+/// ```no_run
+/// use ironspdk::TlsKey;
 ///
-///    static MY_TYPE_TLS = TlsKey<MyType>::new(0); // explicitly take a slot with index 0
-///    ...
-///    MY_TYPE_TLS.set(MyType {...});
-///    let val = MY_TYPE_TLS.get()?;
+/// struct MyIoChannel;
 ///
+/// fn my_ioch_set_and_get() {
+///    // allocate the key at free slot
+///    let my_ioch_tls: TlsKey<MyIoChannel> = TlsKey::alloc();
+///    my_ioch_tls.set(MyIoChannel {});
+///    let val = my_ioch_tls.get().expect("TLS value mut be set");
+/// }
+/// ```
+///
+/// ```no_run
+/// use ironspdk::TlsKey;
+///
+/// struct MyIoChannel;
+///
+/// // explicitly take a slot with index 0
+/// static MY_IOCH_TLS: TlsKey<MyIoChannel> = TlsKey::new(0);
+/// fn my_ioch_set_and_get() {
+///    MY_IOCH_TLS.set(MyIoChannel {});
+///    let val = MY_IOCH_TLS.get().expect("TLS value mut be set");
+/// }
+/// ```
 pub struct TlsKey<T: 'static> {
     slot: usize,
     _marker: PhantomData<fn() -> T>,
@@ -2043,7 +2128,7 @@ impl IoFuture {
 
 // *** Client code for lower-layer bdevs ***
 
-/// Thin wrapper around 'struct spdk_bdev_desc'
+/// Thin wrapper around `struct spdk_bdev_desc`
 #[derive(Clone, Debug)]
 pub struct BdevDesc {
     raw: NonNull<c::spdk_bdev_desc>,
@@ -2102,7 +2187,7 @@ impl LbdevIoChannel {
 }
 
 pub struct LbdevIoCtx {
-    iovs: Vec<c::iovec>,
+    iovs: Iovecs, //Vec<c::iovec>,
     result: Rc<LbdevIoResult>,
 }
 
@@ -2169,7 +2254,7 @@ impl Lbdev {
     }
 
     pub fn read(&self, ch: &LbdevIoChannel, mut io: Io) -> Rc<LbdevIoResult> {
-        let mut iovs_c: Vec<c::iovec> = Vec::new();
+        let mut iovs_c: Iovecs = Iovecs::new();
         for iov_slice in io.iter_iov_mut() {
             let iov_c = c::iovec {
                 iov_base: iov_slice.as_mut_ptr() as *mut _,
@@ -2217,7 +2302,7 @@ impl Lbdev {
     }
 
     pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        let mut iovs_c: Vec<c::iovec> = Vec::new();
+        let mut iovs_c: Iovecs = Iovecs::new();
         for iov_slice in io.iter_iov() {
             let iov_c = c::iovec {
                 iov_base: iov_slice.as_ptr() as *mut _,

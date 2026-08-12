@@ -3,38 +3,61 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)
 ![License](https://img.shields.io/crates/l/ironspdk?style=flat-square)
 
-Rust runtime for SPDK. Write high-performance usermode storage drivers in Rust.
-
-A cutting-edge Rust runtime that brings the power of modern async/await to SPDK (Storage Performance Development Kit). Build block devices and storage modules with the safety and productivity of Rust, while maintaining C-level performance.
+Rust runtime for [SPDK](https://spdk.io/). Write high-performance userspace storage drivers in Rust.
 
 ## Overview
 
-`ironspdk` is an innovative framework that bridges the gap between Rust's memory safety and the raw performance of SPDK. Instead of struggling with C callbacks and manual memory management, you can now write storage drivers using idiomatic Rust with futures, channels, and all the ergonomic benefits Rust provides.
+SPDK provides a high-performance userspace storage framework based on
+polling and asynchronous I/O. Its native API is written in C and uses
+callbacks and explicit resource management.
+
+`ironspdk` provides a Rust interface to this execution model. It uses Rust's
+type system and ownership rules to manage resources such as I/O requests,
+DMA buffers, and I/O channels, while allowing storage operations to be
+implemented using Rust futures.
+
+The runtime is designed to keep the execution model of SPDK rather than
+introducing a general-purpose async runtime on top of it.
+SPDK's reactor-based execution model is integrated with Rust's asynchronous model.
+Rust futures are executed on SPDK threads, and SPDK I/O operations can be composed using
+`async`/`await`.
+
+The project is intended for applications where SPDK's userspace storage
+architecture is appropriate and where Rust's memory safety and language
+features are useful for implementing storage logic.
 
 ## Key Features
 
 ### 🦀 Idiomatic Rust Programming Model
-* **No callback hell**: Use Rust's async/await syntax and futures for natural asynchronous I/O handling
-* **Memory safety**: Leverage Rust's ownership and borrowing system to prevent data races and memory bugs
-* **Type safety**: Compile-time guarantees replace runtime errors
+* **No callback hell**: Use Rust's async/await syntax and futures for natural asynchronous I/O handling.
+* **Memory safety**: Leverage Rust's ownership and borrowing system to prevent data races and memory bugs.
+* **Type safety**: Compile-time guarantees replace runtime errors.
 
 ### ⚡ SPDK Integration
-* **Full SPDK primitives support**: SPDK lightweight threads, I/O channels, block device descriptors, and more are exposed to Rust
-* **Tight runtime integration**: The `ironspdk` runtime executor extends the SPDK poller, allowing Rust code to seamlessly integrate with the SPDK event loop
-* **Zero-copy I/O**: Work directly with SPDK I/O vectors and DMA buffers
-* **Thread-safe operations**: The Rust type system enforces SPDK's multiple-threads-no-locks programming model at compile time
-* **C <-> Rust interoperability**: SPDK (or any other library) C API is still here: just add `unsafe extern "C" spdk_...(...);` to your Rust code
+* **Full SPDK primitives support**: SPDK lightweight threads, I/O channels, block device descriptors, and more are exposed to Rust.
+* **Tight runtime integration**: The `ironspdk` runtime executor extends the SPDK poller, allowing Rust code to seamlessly integrate with the SPDK event loop.
+* **Zero-copy I/O**: Work directly with SPDK I/O vectors and DMA buffers.
+  without unnecessary data copies.
+* **SPDK thread model**: Build on SPDK's thread-per-core, message-passing
+  execution model rather than introducing a conventional shared-state
+  threading model.
+* **C <-> Rust interoperability**: Use SPDK's C API directly from Rust when the higher-level abstractions are not sufficient.
 
 ### 🚀 Performance
-* **C-level performance**: No runtime overhead - compiled to native code with optimizations
-* **Lock-free design**: Leverages SPDK's thread-per-core architecture
-* **Direct FFI binding**: Minimal abstraction over underlying SPDK C APIs
+* **Native code**: Rust code is compiled to native machine code with the
+  same optimization opportunities as other systems languages.
+* **Low-overhead abstractions**: Keep the abstractions close to the
+  underlying SPDK primitives.
+* **Lock-free architecture**: Take advantage of SPDK's thread-per-core model
+  to avoid unnecessary shared-state synchronization.
+* **Direct FFI binding**: Minimal abstraction over underlying SPDK C APIs.
 
-### 🔀 Comprehensive I/O Abstractions
-* **Multiple I/O models**: Support for I/O references (`IoRef`), buffered I/O (`IoBuf`), and unified `Io` enum
-* **I/O splitting**: Advanced API for splitting and reordering I/O operations
-* **DMA buffers**: First-class support for aligned DMA memory allocation and management
-* **Block device abstraction**: Simple trait-based interface for implementing custom block devices
+### 🔀 I/O Abstractions
+* **Multiple I/O representations**: Support for borrowed I/O references (`IoRef`), owned I/O buffers (`IoBuf`), and unified `Io` enum.
+* **I/O splitting**: Advanced API for splitting and reordering I/O operations.
+* **DMA buffers**: Allocate and manage SPDK-compatible DMA memory through
+  Rust-owned buffers.
+* **Block device abstraction**: Simple trait-based interface for implementing custom block devices.
 
 ## Architecture
 
@@ -54,9 +77,9 @@ examples/raid1/        # Simple RAID1 implementation example
 ### Runtime Executor
 
 The `ironspdk` runtime leverages SPDK's poller mechanism:
-- **Thread Control Block (Tcb)**: Manages async task execution on each SPDK thread
-- **Task scheduler**: Queues and polls futures
-- **I/O channel management**: Tracks and manages block device I/O channels per thread
+- **Run queue**: Manages async task execution on each SPDK thread
+- **Poller**: Queues and polls futures
+- **TLS**: Lightweight per SPDK thread storage (to store contexts, for ex. I/O channels)
 - **Waker integration**: Custom waker implementation to notify tasks in runqueue
 
 ## Usage
@@ -224,7 +247,7 @@ pub trait Bdev {
     fn init(&self, ctx: RawBdevHandle);
     fn io_type_supported(&self, io_type: IoType) -> bool;
     fn create_io_channel(&self) -> Box<BdevIoChannel>;
-    fn submit_io(&self, ch: &mut BdevIoChannel, io: BdevIo);
+    fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo);
 }
 ```
 
@@ -266,7 +289,7 @@ impl<'a> Io<'a> {
 
 #### `DmaBuf`
 DMA-allocated memory buffer.
-It may be shared between threads, so it implements Send+Sync+Clone.
+It may be shared between threads, so it implements Send+Sync.
 
 ```rust
 pub struct DmaBuf { /* ... */ }
