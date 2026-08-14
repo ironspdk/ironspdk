@@ -63,6 +63,7 @@ use std::ffi::CString;
 use std::future::Future;
 use std::iter::{Map, Once};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -1996,6 +1997,32 @@ struct Task {
     state: Cell<TaskState>,
 }
 
+// Waker reference without refcounting.
+// Taken from `tokio` and `monoio` libraries
+struct WakerRef<'a> {
+    waker: ManuallyDrop<Waker>,
+    _marker: PhantomData<&'a Task>,
+}
+
+impl std::ops::Deref for WakerRef<'_> {
+    type Target = Waker;
+
+    fn deref(&self) -> &Waker {
+        &self.waker
+    }
+}
+
+fn waker_ref(task: &Rc<Task>) -> WakerRef<'_> {
+    let ptr = Rc::as_ptr(task).cast::<()>();
+
+    let waker = unsafe { Waker::from_raw(RawWaker::new(ptr, &WAKER_VTABLE)) };
+
+    WakerRef {
+        waker: ManuallyDrop::new(waker),
+        _marker: PhantomData,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum TaskState {
     Idle,
@@ -2012,7 +2039,7 @@ impl Task {
 
         task.state.set(TaskState::Running);
 
-        let waker = unsafe { Waker::from_raw(raw_waker(task.clone())) };
+        let waker = waker_ref(&task);
         let mut cx = Context::from_waker(&waker);
 
         let poll_result = {
@@ -2056,8 +2083,8 @@ impl Task {
 }
 
 // RawWaker for future
-unsafe fn raw_waker(task: Rc<Task>) -> RawWaker {
-    RawWaker::new(Rc::into_raw(task) as *const (), &WAKER_VTABLE)
+fn raw_waker(task: *const Task) -> RawWaker {
+    RawWaker::new(task.cast::<()>(), &WAKER_VTABLE)
 }
 
 static WAKER_VTABLE: RawWakerVTable =
@@ -2067,7 +2094,7 @@ unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
     let rc = unsafe { Rc::from_raw(ptr as *const Task) };
     let cloned = rc.clone();
     std::mem::forget(rc);
-    unsafe { raw_waker(cloned) }
+    raw_waker(Rc::into_raw(cloned))
 }
 
 unsafe fn wake(ptr: *const ()) {
