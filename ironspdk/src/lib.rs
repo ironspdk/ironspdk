@@ -349,36 +349,30 @@ pub struct IoRef<'a> {
 
 impl<'a> IoRef<'a> {
     /// Creates an I/O reference from a BdevIo.
+    ///
+    /// # Parameters
+    ///
+    /// * `block_len` - Block length for newli created IoRef.
+    ///
+    ///  SANITY: this parameter is not checked for sanity
+    ///  (for zero, for alignment) doe to performance-related
+    ///  reasons. The caller is responsible for its sanity.
+    ///
+    /// # Returns
+    ///
+    /// Returns an IoRef instance.
     fn from_bdev_io(io: &BdevIo, block_len: usize) -> Result<Self, Error> {
-        if io.dif_type() != DifType::Disable {
-            error!("DIF metadata is not supported yet");
-            return Err(Error::UnsupportedFeature);
-        }
-        // check block_len is aligned to power of 2
-        if block_len != 0 && (!block_len.is_power_of_two() || block_len < 512) {
-            error!("IoRef::from_bdev_io: invalid block_len: {}", block_len);
-            return Err(Error::InvalidArguments);
-        }
-
         let mut data_ptr: *mut c::iovec = std::ptr::null_mut();
         let mut data_cnt: i32 = 0;
-
         let raw = io.raw.as_ptr();
-
         unsafe { c::u_bdev_io_get_iovec(raw, &mut data_ptr, &mut data_cnt) };
 
         let data_iovs = unsafe { from_raw_parts_mut(data_ptr, data_cnt as usize) };
 
         let num_blocks: usize = io.num_blocks().try_into().map_err(|_| Error::IntDowncast)?;
         let parent_block_len = io.block_len();
-
         let size: usize = num_blocks * parent_block_len;
 
-        let block_len = if block_len != 0 {
-            block_len
-        } else {
-            parent_block_len
-        };
         let num_blocks = size / block_len;
 
         let parent_offset_blocks = io.offset_blocks();
