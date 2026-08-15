@@ -61,14 +61,13 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::future::Future;
-use std::iter::{Map, Once};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::slice::{Iter, IterMut, from_raw_parts, from_raw_parts_mut};
+use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -298,9 +297,30 @@ impl DmaBuf {
     }
 }
 
+const IOVCNT_STATIC: usize = 2;
+
 // Performance tests show SmallVec<[c::iovec; 2]> is slightly
 // faster (~= 0.7%) than Vec<c::iovec>
-type Iovecs = SmallVec<[c::iovec; 2]>;
+type Iovecs = SmallVec<[c::iovec; IOVCNT_STATIC]>;
+
+// I/O vector representation for IoRef.
+#[derive(Debug)]
+enum IoRefIovecs<'a> {
+    // Borrowed directly from parent (e.g., `BdevIo` iovec array)
+    Borrowed(&'a [c::iovec]),
+    // Owned inline storage for split results.
+    // Inlined for small iovec count; heap-allocated only beyond that
+    Owned(Iovecs),
+}
+
+impl IoRefIovecs<'_> {
+    pub(crate) fn as_slice(&self) -> &[c::iovec] {
+        match self {
+            IoRefIovecs::Borrowed(slice) => slice,
+            IoRefIovecs::Owned(vec) => vec.as_slice(),
+        }
+    }
+}
 
 /// A zero-copy view of an SPDK bdev I/O request.
 ///
@@ -335,7 +355,7 @@ type Iovecs = SmallVec<[c::iovec; 2]>;
 #[derive(Debug)]
 pub struct IoRef<'a> {
     /// Scatter-gather list
-    data_iovs: Iovecs,
+    iovs: IoRefIovecs<'a>,
     /// Logical block address (LBA)
     offset_blocks: u64,
     /// Offset in parent IoRef (in blocks), zero for parent
@@ -368,11 +388,12 @@ impl<'a> IoRef<'a> {
         let raw = io.raw.as_ptr();
         unsafe { c::u_bdev_io_get_iovec(raw, &mut data_ptr, &mut data_cnt) };
 
-        let data_iovs = unsafe { from_raw_parts_mut(data_ptr, data_cnt as usize) };
+        let data_iovs: &[c::iovec] = unsafe { from_raw_parts(data_ptr, data_cnt as usize) };
 
-        let num_blocks: usize = io.num_blocks().try_into().map_err(|_| Error::IntDowncast)?;
+        let parent_num_blocks: usize =
+            io.num_blocks().try_into().map_err(|_| Error::IntDowncast)?;
         let parent_block_len = io.block_len();
-        let size: usize = num_blocks * parent_block_len;
+        let size: usize = parent_num_blocks * parent_block_len;
 
         let num_blocks = size / block_len;
 
@@ -380,13 +401,18 @@ impl<'a> IoRef<'a> {
         let offset_blocks = parent_offset_blocks * (parent_block_len as u64) / (block_len as u64);
 
         Ok(Self {
-            data_iovs: SmallVec::from_slice(data_iovs),
+            iovs: IoRefIovecs::Borrowed(data_iovs), // zero copy, borrow BdevIo's iovecs
             offset_blocks,
             ref_offset: 0usize,
             num_blocks,
             block_len,
             _marker: PhantomData,
         })
+    }
+
+    /// Returns underlying iovec slice. This is a zero-copy operation.
+    fn as_iovs(&self) -> &[c::iovec] {
+        self.iovs.as_slice()
     }
 
     /// Updates the offset in blocks.
@@ -408,29 +434,27 @@ impl<'a> IoRef<'a> {
     pub fn to_buf(&self) -> Result<IoBuf, Error> {
         let total = self.total_bytes();
         let mut dmabuf = DmaBuf::new(total)?;
-        let data = dmabuf.as_mut_slice();
+        let buf = dmabuf.as_mut_slice();
         let mut dst_offset = 0;
-        for iov in &self.data_iovs {
-            let src = iov.iov_base as *const u8;
-            let len = iov.iov_len;
+        for iov in self.as_iovs() {
             unsafe {
-                std::ptr::copy_nonoverlapping(src, data.as_mut_ptr().add(dst_offset), len);
+                std::ptr::copy_nonoverlapping(
+                    iov.iov_base as *const u8,
+                    buf.as_mut_ptr().add(dst_offset),
+                    iov.iov_len,
+                );
             }
-            dst_offset += len;
+            dst_offset += iov.iov_len;
         }
         debug_assert!(dst_offset == total);
-        Ok(IoBuf {
-            data: dmabuf,
-            offset_blocks: self.offset_blocks,
-            num_blocks: self.num_blocks,
-            block_len: self.block_len,
-        })
+        IoBuf::new(dmabuf, self.offset_blocks, self.block_len)
     }
 }
 
 #[derive(Debug)]
 pub struct IoBuf {
     data: DmaBuf,
+    precalc_iov: c::iovec,
     offset_blocks: u64,
     num_blocks: usize,
     block_len: usize,
@@ -444,12 +468,22 @@ impl IoBuf {
             error!("data length is not aligned to block length");
             return Err(Error::InvalidArguments);
         }
+        let precalc_iov = c::iovec {
+            iov_base: data.as_slice().as_ptr() as *mut _,
+            iov_len: data_len,
+        };
         Ok(Self {
             data,
+            precalc_iov,
             offset_blocks,
             num_blocks: data_len / block_len,
             block_len,
         })
+    }
+
+    /// Returns underlying precalculated iovec as a slice of length 1.
+    fn as_iovs(&self) -> &[c::iovec] {
+        std::slice::from_ref(&self.precalc_iov)
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -466,42 +500,6 @@ impl IoBuf {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.data.as_mut_slice()
-    }
-}
-
-type IoVecIter<'a> = Iter<'a, c::iovec>;
-
-pub enum IoIter<'a> {
-    Ref(Map<IoVecIter<'a>, fn(&'a c::iovec) -> &'a [u8]>),
-    Buf(Once<&'a [u8]>),
-}
-
-impl<'a> Iterator for IoIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            IoIter::Ref(iter) => iter.next(),
-            IoIter::Buf(iter) => iter.next(),
-        }
-    }
-}
-
-type IoVecIterMut<'a> = IterMut<'a, c::iovec>;
-
-pub enum IoIterMut<'a> {
-    Ref(Map<IoVecIterMut<'a>, fn(&'a mut c::iovec) -> &'a mut [u8]>),
-    Buf(Once<&'a mut [u8]>),
-}
-
-impl<'a> Iterator for IoIterMut<'a> {
-    type Item = &'a mut [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            IoIterMut::Ref(iter) => iter.next(),
-            IoIterMut::Buf(iter) => iter.next(),
-        }
     }
 }
 
@@ -585,7 +583,7 @@ impl<'a> IoRefSplitter<'a> {
         let child_block_len = child_block_len.unwrap_or(parent.block_len);
         let parent_total_bytes = parent.num_blocks * parent.block_len;
         Self {
-            parent_iovs: &parent.data_iovs,
+            parent_iovs: parent.as_iovs(),
             parent_total_bytes,
             child_block_len,
             cursor_bytes: 0,
@@ -619,7 +617,7 @@ impl<'a> IoRefSplitter<'a> {
         let iovs = slice_iovs(self.parent_iovs, self.cursor_bytes, bytes)?;
         debug_assert!(self.cursor_bytes.is_multiple_of(self.child_block_len));
         let ioref = IoRef {
-            data_iovs: iovs,
+            iovs: IoRefIovecs::Owned(iovs),
             offset_blocks: 0u64, // must be set later manually by the caller
             ref_offset: self.cursor_bytes / self.child_block_len,
             num_blocks: blocks,
@@ -667,6 +665,21 @@ impl<'a> Io<'a> {
     /// Creates an I/O operation from a BdevIo.
     pub fn from_bdev_io(io: &BdevIo, block_len: usize) -> Result<Self, Error> {
         Ok(Io::Ref(IoRef::from_bdev_io(io, block_len)?))
+    }
+
+    /// Returns the underlying I/O vectors slice for direct SPDK usage.
+    ///
+    /// ** Zero-copy, zero-alloc for both IoRef and IoBuf **
+    /// - `IoRef`: returns internal iovec slice.
+    /// - `IoBuf`: returns a slice of length 1 containing the owned buffer.
+    ///
+    /// The same slice works for both read and write because `c::iovec.iov_base`
+    /// is always `*mut c_void`.
+    pub fn as_iovs(&self) -> &[c::iovec] {
+        match self {
+            Io::Ref(ioref) => ioref.as_iovs(),
+            Io::Buf(iobuf) => iobuf.as_iovs(),
+        }
     }
 
     /// Returns `true` if this is a reference (zero-copy).
@@ -718,71 +731,11 @@ impl<'a> Io<'a> {
         }
     }
 
-    /// Returns an iterator over the data buffers of the I/O.
-    ///
-    /// For [`Io::Ref`], the iterator yields one slice for each scatter/gather
-    /// I/O vector.
-    ///
-    /// For [`Io::Buf`], which owns a contiguous [`DmaBuf`], the
-    /// iterator yields a single slice containing the entire buffer.
-    ///
-    /// The returned slices cover the data associated with the I/O; their total
-    /// length is equal to [`Io::total_bytes`](Self::total_bytes).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ironspdk::{DmaBuf, Error, Io};
-    ///
-    /// fn count_total_bytes(io: &Io) -> Result<usize, Error> {
-    ///     let buf = DmaBuf::new(1024)?;
-    ///     let io = Io::new_buf(buf, 0, 512)?;
-    ///
-    ///     // The buffer contains two 512-byte blocks, so the I/O is 1024 bytes.
-    ///     let total: usize = io.iter_iov().map(|s| s.len()).sum();
-    ///     assert_eq!(total, io.num_blocks() * 512);
-    ///
-    ///     Ok(total)
-    /// }
-    /// ```
-    pub fn iter_iov(&self) -> IoIter<'_> {
-        match self {
-            Io::Ref(ioref) => {
-                fn map_iovec(iovec: &c::iovec) -> &[u8] {
-                    unsafe { from_raw_parts(iovec.iov_base as *const u8, iovec.iov_len) }
-                }
-                IoIter::Ref(ioref.data_iovs.iter().map(map_iovec))
-            }
-            Io::Buf(iobuf) => IoIter::Buf(std::iter::once(iobuf.as_slice())),
-        }
-    }
-
-    /// Returns a mutable iterator over I/O vectors.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ironspdk::{DmaBuf, Error, Io};
-    ///
-    /// fn fill_iov(io: &mut Io) -> Result<(), Error> {
-    ///     let buf = DmaBuf::new(1024)?;
-    ///     let mut io = Io::new_buf(buf, 0, 512)?;
-    ///     for slice in io.iter_iov_mut() {
-    ///         slice.fill(0xFF);
-    ///     }
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn iter_iov_mut(&mut self) -> IoIterMut<'_> {
-        match self {
-            Io::Ref(ioref) => {
-                fn map_iovec(iovec: &mut c::iovec) -> &mut [u8] {
-                    unsafe { from_raw_parts_mut(iovec.iov_base as *mut u8, iovec.iov_len) }
-                }
-                IoIterMut::Ref(ioref.data_iovs.iter_mut().map(map_iovec))
-            }
-            Io::Buf(iobuf) => IoIterMut::Buf(std::iter::once(iobuf.as_mut_slice())),
-        }
+    /// Convenience iterator (not fast path).
+    pub fn iter_iov(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.as_iovs()
+            .iter()
+            .map(|iov| unsafe { from_raw_parts(iov.iov_base as *const u8, iov.iov_len) })
     }
 }
 
@@ -2207,8 +2160,8 @@ impl LbdevIoChannel {
     }
 }
 
-pub struct LbdevIoCtx {
-    iovs: Iovecs, //Vec<c::iovec>,
+pub struct LbdevIoCtx<'a> {
+    io: Io<'a>,
     result: Rc<LbdevIoResult>,
 }
 
@@ -2274,36 +2227,33 @@ impl Lbdev {
         Rc::new(LbdevIoChannel::new(ch))
     }
 
-    pub fn read(&self, ch: &LbdevIoChannel, mut io: Io) -> Rc<LbdevIoResult> {
-        let mut iovs_c: Iovecs = Iovecs::new();
-        for iov_slice in io.iter_iov_mut() {
-            let iov_c = c::iovec {
-                iov_base: iov_slice.as_mut_ptr() as *mut _,
-                iov_len: iov_slice.len(),
-            };
-            iovs_c.push(iov_c);
-        }
-
+    pub fn read(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
         let result = Rc::new(LbdevIoResult {
             fut: UnsafeCell::new(IoFuture::new()),
             success: Cell::new(false),
         });
+        let (iovs_ptr, iovcnt) = {
+            let iovs = io.as_iovs();
+            let iovs_ptr = iovs.as_ptr();
+            let iovcnt = iovs.len();
+            (iovs_ptr, iovcnt)
+        };
+        let lba = io.offset_blocks();
+        let num_blocks = io.num_blocks();
         let ctx = Rc::new(LbdevIoCtx {
-            iovs: iovs_c,
+            io, // `io` should live until the callback is called
             result: result.clone(),
         });
 
         // increase ref count for spdk_rwio_complete_cb()
         let ctx_ptr = Rc::into_raw(ctx.clone()) as *mut _;
 
-        let lba = io.offset_blocks();
-        let num_blocks = io.num_blocks();
         let rc = unsafe {
             c::spdk_bdev_readv_blocks(
                 self.desc.raw.as_ptr(),
                 ch.raw.as_ptr(),
-                ctx.iovs.as_ptr() as *mut c_void,
-                ctx.iovs.len() as i32,
+                iovs_ptr as *mut c_void,
+                iovcnt as i32,
                 lba,
                 num_blocks as u64,
                 spdk_rwio_complete_cb,
@@ -2323,35 +2273,32 @@ impl Lbdev {
     }
 
     pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        let mut iovs_c: Iovecs = Iovecs::new();
-        for iov_slice in io.iter_iov() {
-            let iov_c = c::iovec {
-                iov_base: iov_slice.as_ptr() as *mut _,
-                iov_len: iov_slice.len(),
-            };
-            iovs_c.push(iov_c);
-        }
-
         let result = Rc::new(LbdevIoResult {
             fut: UnsafeCell::new(IoFuture::new()),
             success: Cell::new(false),
         });
+        let (iovs_ptr, iovcnt) = {
+            let iovs = io.as_iovs();
+            let iovs_ptr = iovs.as_ptr();
+            let iovcnt = iovs.len();
+            (iovs_ptr, iovcnt)
+        };
+        let lba = io.offset_blocks();
+        let num_blocks = io.num_blocks();
         let ctx = Rc::new(LbdevIoCtx {
-            iovs: iovs_c,
+            io, // `io` should live until the callback is called
             result: result.clone(),
         });
 
         // increase ref count for spdk_rwio_complete_cb()
         let ctx_ptr = Rc::into_raw(ctx.clone()) as *mut _;
 
-        let lba = io.offset_blocks();
-        let num_blocks = io.num_blocks();
         let rc = unsafe {
             c::spdk_bdev_writev_blocks(
                 self.desc.raw.as_ptr(),
                 ch.raw.as_ptr(),
-                ctx.iovs.as_ptr() as *mut c_void,
-                ctx.iovs.len() as i32,
+                iovs_ptr as *mut c_void,
+                iovcnt as i32,
                 lba,
                 num_blocks as u64,
                 spdk_rwio_complete_cb,
