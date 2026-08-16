@@ -64,8 +64,7 @@ impl Bdev for Raid1Bdev {
 
     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
         let this_ptr = self as *const Raid1Bdev;
-        let current = SpdkThread::current();
-        current.spawn(async move {
+        SpdkThread::spawn_local(async move {
             let this = unsafe { &*this_ptr };
             let ch = ch.downcast_mut::<Raid1IoChannel>();
             debug_assert!(!ch.children.is_empty());
@@ -103,7 +102,7 @@ impl Raid1Bdev {
             let next = (ch.next_read + 1) % n;
             ch.next_read = next;
 
-            let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
+            let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
             let res = ch.children[next].read(&ch.chans[next], ioref);
             res.future().await;
 
@@ -126,7 +125,7 @@ impl Raid1Bdev {
     async fn write(&self, ch: &mut Raid1IoChannel, io: BdevIo) {
         let mut crs: SmallVec<[_; 4]> = SmallVec::new();
         for (idx, child) in ch.children.iter().enumerate() {
-            let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
+            let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
             let child_res = child.write(&ch.chans[idx], ioref);
             crs.push(child_res);
         }
