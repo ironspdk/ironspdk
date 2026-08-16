@@ -103,7 +103,7 @@ impl Raid1Bdev {
             let next = (ch.next_read + 1) % n;
             ch.next_read = next;
 
-            let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
+            let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
             let res = ch.children[next].read(&ch.chans[next], ioref);
             res.future().await;
 
@@ -126,7 +126,7 @@ impl Raid1Bdev {
     async fn write(&self, ch: &mut Raid1IoChannel, io: BdevIo) {
         let mut crs: SmallVec<[_; 4]> = SmallVec::new();
         for (idx, child) in ch.children.iter().enumerate() {
-            let ioref = Io::from_bdev_io(&io, 0).expect("Cannot convert to IoRef");
+            let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
             let child_res = child.write(&ch.chans[idx], ioref);
             crs.push(child_res);
         }
