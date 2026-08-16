@@ -64,8 +64,7 @@ impl Bdev for Raid1Bdev {
 
     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
         let this_ptr = self as *const Raid1Bdev;
-        let current = SpdkThread::current();
-        current.spawn(async move {
+        SpdkThread::spawn_local(async move {
             let this = unsafe { &*this_ptr };
             let ch = ch.downcast_mut::<Raid1IoChannel>();
             debug_assert!(!ch.children.is_empty());
