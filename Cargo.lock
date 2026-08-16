@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "ironspdk"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "ctor",
  "env_logger",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "ironspdk-sys"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "cc",
  "glob",
