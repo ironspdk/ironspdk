@@ -2192,15 +2192,11 @@ impl LbdevIoChannel {
 
 pub struct LbdevIoCtx<'a> {
     io: Io<'a>,
-    result: Rc<LbdevIoResult>,
-}
-
-pub struct LbdevIoResult {
     fut: UnsafeCell<IoFuture>,
     success: Cell<bool>,
 }
 
-impl LbdevIoResult {
+impl<'a> LbdevIoCtx<'a> {
     #[allow(clippy::mut_from_ref)]
     pub fn future(&self) -> &mut IoFuture {
         unsafe { &mut *self.fut.get() }
@@ -2218,9 +2214,9 @@ extern "C" fn spdk_rwio_complete_cb(
 ) {
     let ctx = unsafe { Rc::from_raw(cb_arg as *const LbdevIoCtx) };
     // pass status to caller which awaits
-    ctx.result.success.set(success);
+    ctx.success.set(success);
     // wake waiter
-    let fut = unsafe { &mut *ctx.result.fut.get() };
+    let fut = unsafe { &mut *ctx.fut.get() };
     fut.complete();
 
     // this callback must free bdev_io
@@ -2228,6 +2224,8 @@ extern "C" fn spdk_rwio_complete_cb(
 
     // ctx ref count is decremented here
 }
+
+pub type LbdevIoResult<'a> = Rc<LbdevIoCtx<'a>>;
 
 /// Lower SPDK block device which is accessed using client SPDK API.
 /// Used by application code and implementors of 'trait Bdev'
@@ -2257,11 +2255,7 @@ impl Lbdev {
         Rc::new(LbdevIoChannel::new(ch))
     }
 
-    pub fn read(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        let result = Rc::new(LbdevIoResult {
-            fut: UnsafeCell::new(IoFuture::new()),
-            success: Cell::new(false),
-        });
+    pub fn read<'a>(&self, ch: &LbdevIoChannel, io: Io<'a>) -> LbdevIoResult<'a> {
         let (iovs_ptr, iovcnt) = {
             let iovs = io.as_iovs();
             let iovs_ptr = iovs.as_ptr();
@@ -2270,9 +2264,11 @@ impl Lbdev {
         };
         let lba = io.offset_blocks();
         let num_blocks = io.num_blocks();
+
         let ctx = Rc::new(LbdevIoCtx {
-            io, // `io` should live until the callback is called
-            result: result.clone(),
+            io,
+            fut: UnsafeCell::new(IoFuture::new()),
+            success: Cell::new(false),
         });
 
         // increase ref count for spdk_rwio_complete_cb()
@@ -2295,18 +2291,14 @@ impl Lbdev {
             // need to drop ctx ref count
             drop(unsafe { Rc::from_raw(ctx_ptr as *const LbdevIoCtx) });
 
-            result.success.set(false);
-            let fut = unsafe { &mut *result.fut.get() };
+            ctx.success.set(false);
+            let fut = unsafe { &mut *ctx.fut.get() };
             fut.complete();
         }
-        result
+        ctx
     }
 
-    pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult> {
-        let result = Rc::new(LbdevIoResult {
-            fut: UnsafeCell::new(IoFuture::new()),
-            success: Cell::new(false),
-        });
+    pub fn write<'a>(&self, ch: &LbdevIoChannel, io: Io<'a>) -> LbdevIoResult<'a> {
         let (iovs_ptr, iovcnt) = {
             let iovs = io.as_iovs();
             let iovs_ptr = iovs.as_ptr();
@@ -2315,9 +2307,11 @@ impl Lbdev {
         };
         let lba = io.offset_blocks();
         let num_blocks = io.num_blocks();
+
         let ctx = Rc::new(LbdevIoCtx {
-            io, // `io` should live until the callback is called
-            result: result.clone(),
+            io,
+            fut: UnsafeCell::new(IoFuture::new()),
+            success: Cell::new(false),
         });
 
         // increase ref count for spdk_rwio_complete_cb()
@@ -2340,11 +2334,11 @@ impl Lbdev {
             // need to drop ctx ref count
             drop(unsafe { Rc::from_raw(ctx_ptr as *const LbdevIoCtx) });
 
-            result.success.set(false);
-            let fut = unsafe { &mut *result.fut.get() };
+            ctx.success.set(false);
+            let fut = unsafe { &mut *ctx.fut.get() };
             fut.complete();
         }
-        result
+        ctx
     }
 }
 
