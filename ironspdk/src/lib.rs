@@ -1944,12 +1944,6 @@ impl Drop for Tcb {
     }
 }
 
-/// Task (wrapper of Future)
-struct Task {
-    future: RefCell<Pin<Box<dyn Future<Output = ()>>>>,
-    state: Cell<TaskState>,
-}
-
 // Waker reference without refcounting.
 // Taken from `tokio` and `monoio` libraries
 struct WakerRef<'a> {
@@ -1982,6 +1976,12 @@ enum TaskState {
     Running,
     Notified,
     Ready,
+}
+
+/// Task (wrapper of Future)
+struct Task {
+    future: RefCell<Pin<Box<dyn Future<Output = ()>>>>,
+    state: Cell<TaskState>,
 }
 
 impl Task {
