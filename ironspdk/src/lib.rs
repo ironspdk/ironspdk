@@ -1592,6 +1592,28 @@ impl SpdkThread {
         });
     }
 
+    /// Spawns a future immediately on the current SPDK thread.
+    ///
+    /// The future is polled immediately. If it returns `Pending`, it remains
+    /// registered with the current thread's executor and will be polled again
+    /// when woken.
+    ///
+    /// Unlike [`SpdkThread::spawn`], this does not enqueue a message to the
+    /// current SPDK thread before the first poll.
+    ///
+    /// This is the preferred way to spawn a future on the current SPDK thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside of an SPDK thread.
+    pub fn spawn_local<F>(fut: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        let task = Task::new(fut);
+        Task::poll(task);
+    }
+
     /// Requests the SPDK thread to exit.
     ///
     /// # SAFETY
@@ -1886,10 +1908,7 @@ impl Tcb {
     where
         F: Future<Output = ()> + 'static,
     {
-        let task = Rc::new(Task {
-            future: RefCell::new(Box::pin(fut)),
-            state: Cell::new(TaskState::Idle),
-        });
+        let task = Task::new(fut);
         self.runq.borrow_mut().push_back(task);
     }
 
@@ -1985,6 +2004,17 @@ struct Task {
 }
 
 impl Task {
+    #[inline]
+    fn new<F>(fut: F) -> Rc<Self>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        Rc::new(Self {
+            future: RefCell::new(Box::pin(fut)),
+            state: Cell::new(TaskState::Idle),
+        })
+    }
+
     fn poll(task: Rc<Task>) {
         if task.state.get() == TaskState::Running {
             return;
