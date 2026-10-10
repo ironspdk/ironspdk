@@ -1,0 +1,110 @@
+name: RAID5 simple test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - raid-simple-test
+
+jobs:
+  raid5-simple-test:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            clang \
+            libclang-dev \
+            libaio-dev \
+            liburing-dev \
+            libnuma-dev \
+            uuid-dev \
+            libssl-dev \
+            libkeyutils-dev \
+            libfuse3-dev \
+            liblz4-dev \
+            fio \
+            nbd-client
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: |
+          SPDK=./extern/spdk
+          sudo $SPDK/scripts/pkgdep.sh
+          make test-build
+
+      - name: Start SPDK
+        run: |
+          N=$(nproc)
+          CORE_MASK=$(( (1 << N) - 1 ))
+          printf -v CORE_MASK_HEX "0x%x" "$CORE_MASK"
+          sudo RUST_LOG=debug ./target/debug/raid5 \
+              --no-huge -s 8192 -m $CORE_MASK_HEX \
+              --base 0x100000000 2>&1 > spdk.log &
+          echo $! > spdk.pid
+          sleep 5
+
+      - name: Create RAID5 block device
+        run: |
+          SPDK=./extern/spdk
+          for i in 0 1 2 3 4; do
+            sudo $SPDK/scripts/rpc.py bdev_malloc_create -b malloc${i} 64 512
+          done
+          sudo PYTHONPATH=./examples/raid5/scripts \
+            $SPDK/scripts/rpc.py --plugin raid5 rs_raid5_create --name r5 \
+            -z 16 \
+            -c malloc0,malloc1,malloc2,malloc3,malloc4
+
+      - name: Create NBD block device
+        run: |
+          sudo modprobe nbd max_path=8
+          for i in $(seq 1 30); do
+            [ -b /dev/nbd0 ] && break
+            sleep 1
+          done
+          SPDK=./extern/spdk
+          sudo $SPDK/scripts/rpc.py nbd_start_disk r5 /dev/nbd0
+
+      - name: Run non-full-stripe fio on RAID5
+        run: |
+          sudo fio --filename=/dev/nbd0 \
+            --direct=1 \
+            --rw=randrw \
+            --bs=512 \
+            --iodepth=32 \
+            --ioengine=libaio \
+            --numjobs=$(( $(nproc) * 4 )) \
+            --time_based \
+            --runtime=20 \
+            --verify=md5 \
+            --name=test
+
+      - name: Shutdown
+        if: always()
+        run: |
+          SPDK=./extern/spdk
+          sudo $SPDK/scripts/rpc.py nbd_stop_disk /dev/nbd0 || true
+          sudo PYTHONPATH=./scripts \
+            $SPDK/scripts/rpc.py --plugin ironspdk rs_bdev_delete r5 || true
+          for i in 0 1 2 3 4; do
+            sudo $SPDK/scripts/rpc.py bdev_malloc_delete malloc${i} || true
+          done
+          sudo kill $(cat spdk.pid) || true
+          if [ -f spdk.log ]; then
+            echo "*** SPDK log: ***"
+            cat spdk.log
+          fi
+          echo "***    End    ***"
