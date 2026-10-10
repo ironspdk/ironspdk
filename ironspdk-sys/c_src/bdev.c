@@ -14,12 +14,6 @@ void *u_io_channel_get_rust_ctx(void *io_ch_ctx)
     return chctx->rust_ch;
 }
 
-void u_io_channel_set_rust_ctx(void *io_ch_ctx, void *rust_ctx)
-{
-    struct io_channel_ctx *chctx = io_ch_ctx;
-    chctx->rust_ch = rust_ctx;
-}
-
 static int u_bdev_io_channel_create(void *io_device, void *ctx)
 {
     struct spdk_bdev *bdev = io_device;

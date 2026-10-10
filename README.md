@@ -312,9 +312,10 @@ pub struct Lbdev { /* ... */ }
 
 impl Lbdev {
     pub fn open(name: &str) -> Result<Self, Error>;
+    pub fn desc(&self) -> &BdevDesc;
     pub fn get_io_channel(&self) -> Rc<LbdevIoChannel>;
-    pub fn read(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult>;
-    pub fn write(&self, ch: &LbdevIoChannel, io: Io) -> Rc<LbdevIoResult>;
+    pub fn read(&self, ch: &LbdevIoChannel, ctx: &LbdevIoCtx<'_>);
+    pub fn write(&self, ch: &LbdevIoChannel, ctx: &LbdevIoCtx<'_>);
 }
 ```
 

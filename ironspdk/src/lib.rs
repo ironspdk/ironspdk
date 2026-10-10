@@ -63,7 +63,7 @@ use std::ffi::CString;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::os::raw::c_void;
+use std::os::raw::{c_uint, c_void};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -76,8 +76,8 @@ use thiserror::Error;
 mod c_enum;
 use c_enum::*;
 mod app;
-mod c;
 pub use app::*;
+use ironspdk_sys::ffi as c;
 pub mod rpc;
 
 static BDEV_REGISTRY: OnceLock<Mutex<HashMap<String, BdevHandle>>> = OnceLock::new();
@@ -148,7 +148,7 @@ fn tcb_registry() -> &'static RwLock<HashMap<ThreadKey, TcbPtr>> {
 }
 
 c_enum! {
-    pub enum DifType: i32 {
+    pub enum DifType: u32 {
         Disable = c::SPDK_DIF_DISABLE,
         Type1   = c::SPDK_DIF_TYPE1,
         Type2   = c::SPDK_DIF_TYPE2,
@@ -171,7 +171,7 @@ c_enum! {
 /// let io_type = IoType::Read;
 /// println!("I/O type: {:?}", io_type);
 /// ```
-    pub enum IoType: i32 {
+    pub enum IoType: u32 {
         Invalid     = c::SPDK_BDEV_IO_TYPE_INVALID,
         Read        = c::SPDK_BDEV_IO_TYPE_READ,
         Write       = c::SPDK_BDEV_IO_TYPE_WRITE,
@@ -194,6 +194,8 @@ c_enum! {
         Copy        = c::SPDK_BDEV_IO_TYPE_COPY,
         NvmeIovMd   = c::SPDK_BDEV_IO_TYPE_NVME_IOV_MD,
         NvmeNssr    = c::SPDK_BDEV_IO_TYPE_NVME_NSSR,
+
+        // NOTE: comment out this line for SPDK versions < v25.05
         WriteUncorrectable = c::SPDK_BDEV_IO_TYPE_WRITE_UNCORRECTABLE,
     }
 }
@@ -394,11 +396,15 @@ impl<'a> IoRef<'a> {
             io.num_blocks().try_into().map_err(|_| Error::IntDowncast)?;
         let parent_block_len = io.block_len();
         let size: usize = parent_num_blocks * parent_block_len;
+        debug_assert!(block_len != 0);
+        debug_assert!(size.is_multiple_of(block_len));
 
         let num_blocks = size / block_len;
 
         let parent_offset_blocks = io.offset_blocks();
-        let offset_blocks = parent_offset_blocks * (parent_block_len as u64) / (block_len as u64);
+        let parent_offset_bytes = parent_offset_blocks * parent_block_len as u64;
+        debug_assert!(parent_offset_bytes.is_multiple_of(block_len as u64));
+        let offset_blocks = parent_offset_bytes / block_len as u64;
 
         Ok(Self {
             iovs: IoRefIovecs::Borrowed(data_iovs), // zero copy, borrow BdevIo's iovecs
@@ -448,6 +454,35 @@ impl<'a> IoRef<'a> {
         }
         debug_assert!(dst_offset == total);
         IoBuf::new(dmabuf, self.offset_blocks, self.block_len)
+    }
+
+    /// Copies `data` into the memory referenced by this I/O reference.
+    ///
+    /// This is intended for bdev implementations to fill the read buffer of
+    /// an incoming request. `data.len()` must be equal to
+    /// [`total_bytes`](Self::total_bytes).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the underlying request memory is writable
+    /// (i.e. the parent request is a READ request).
+    pub unsafe fn copy_from_slice(&self, data: &[u8]) {
+        assert_eq!(
+            data.len(),
+            self.total_bytes(),
+            "copy_from_slice: length mismatch"
+        );
+        let mut pos = 0;
+        for iov in self.as_iovs() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(pos),
+                    iov.iov_base as *mut u8,
+                    iov.iov_len,
+                );
+            }
+            pos += iov.iov_len;
+        }
     }
 }
 
@@ -500,6 +535,11 @@ impl IoBuf {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.data.as_mut_slice()
+    }
+
+    /// Consumes the `IoBuf` and returns the inner [`DmaBuf`]
+    pub fn into_inner(self) -> DmaBuf {
+        self.data
     }
 }
 
@@ -712,6 +752,14 @@ impl<'a> Io<'a> {
         match self {
             Io::Ref(ioref) => ioref.offset_blocks,
             Io::Buf(iobuf) => iobuf.offset_blocks,
+        }
+    }
+
+    /// Updates the offset in blocks (LBA).
+    pub fn update_offset_blocks(&mut self, offset_blocks: u64) {
+        match self {
+            Io::Ref(ioref) => ioref.update_offset_blocks(offset_blocks),
+            Io::Buf(iobuf) => iobuf.offset_blocks = offset_blocks,
         }
     }
 
@@ -1061,7 +1109,7 @@ impl Drop for RcBdevIoChannel {
 
 impl RcBdevIoChannel {
     pub fn new(rawbdev: RawBdevHandle) -> Self {
-        let raw = unsafe { c::spdk_get_io_channel(rawbdev.as_ptr()) };
+        let raw = unsafe { c::spdk_get_io_channel(rawbdev.as_ptr() as *mut c_void) };
         Self {
             raw: NonNull::new(raw).expect("bdev null pointer"),
         }
@@ -1347,7 +1395,7 @@ extern "C" fn rsu_io_channel_destroy(ctxt: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: i32) -> bool {
+extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: c_uint) -> bool {
     debug_assert!(!bdev_ctxt.is_null());
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
     let io_type = match IoType::try_from_c(c_io_type) {
@@ -1570,7 +1618,7 @@ impl SpdkThread {
         let rc = unsafe {
             c::spdk_thread_send_msg(
                 self.raw.as_ptr(),
-                trampoline,
+                Some(trampoline),
                 Box::into_raw(boxed) as *mut _,
             )
         };
@@ -1898,7 +1946,7 @@ impl Tcb {
         });
 
         let tcb_ptr = Box::into_raw(tcb);
-        let poller = unsafe { c::spdk_poller_register(poller_fn, tcb_ptr as *mut _, 0) };
+        let poller = unsafe { c::spdk_poller_register(Some(poller_fn), tcb_ptr as *mut _, 0) };
         assert!(!poller.is_null(), "Failed to create poller");
         unsafe { (*tcb_ptr).poller.set(poller) };
         tcb_ptr
@@ -2133,7 +2181,7 @@ impl IoFuture {
 // *** Client code for lower-layer bdevs ***
 
 /// Thin wrapper around `struct spdk_bdev_desc`
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BdevDesc {
     raw: NonNull<c::spdk_bdev_desc>,
 }
@@ -2172,7 +2220,7 @@ impl Drop for BdevDesc {
 }
 
 /// SPDK I/O channel intended to use with Lbdev
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LbdevIoChannel {
     raw: NonNull<c::spdk_io_channel>,
 }
@@ -2190,20 +2238,46 @@ impl LbdevIoChannel {
     }
 }
 
-pub struct LbdevIoCtx<'a> {
-    io: Io<'a>,
+pub struct LbdevIoCtx {
     fut: UnsafeCell<IoFuture>,
     success: Cell<bool>,
 }
 
-impl<'a> LbdevIoCtx<'a> {
-    #[allow(clippy::mut_from_ref)]
-    pub fn future(&self) -> &mut IoFuture {
-        unsafe { &mut *self.fut.get() }
+impl LbdevIoCtx {
+    pub fn new() -> Self {
+        Self {
+            fut: UnsafeCell::new(IoFuture::new()),
+            success: Cell::new(false),
+        }
     }
+}
 
-    pub fn success(&self) -> bool {
-        self.success.get()
+impl Default for LbdevIoCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Future returned from Lbdev::{read|write}().
+/// It references LbdevIoCtx. It is statically ensured
+/// it cannot outlive it.
+/// # Safety
+/// [`LbdevIoFuture`] _must_ be awaited before related LbdevIoCtx is dropped.
+#[must_use]
+pub struct LbdevIoFuture<'ctx> {
+    ctx: &'ctx mut LbdevIoCtx,
+}
+
+impl<'ctx> Future for LbdevIoFuture<'ctx> {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        let ctx = &mut *self.get_mut().ctx;
+        let fut = unsafe { &mut *ctx.fut.get() };
+        match Pin::new(fut).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(ctx.success.get()),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -2212,7 +2286,7 @@ extern "C" fn spdk_rwio_complete_cb(
     success: bool,
     cb_arg: *mut std::ffi::c_void,
 ) {
-    let ctx = unsafe { Rc::from_raw(cb_arg as *const LbdevIoCtx) };
+    let ctx = unsafe { &*(cb_arg as *const LbdevIoCtx) };
     // pass status to caller which awaits
     ctx.success.set(success);
     // wake waiter
@@ -2221,16 +2295,12 @@ extern "C" fn spdk_rwio_complete_cb(
 
     // this callback must free bdev_io
     unsafe { c::spdk_bdev_free_io(bdev_io) };
-
-    // ctx ref count is decremented here
 }
-
-pub type LbdevIoResult<'a> = Rc<LbdevIoCtx<'a>>;
 
 /// Lower SPDK block device which is accessed using client SPDK API.
 /// Used by application code and implementors of 'trait Bdev'
 /// for accessing lower-layer bdevs
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Lbdev {
     name: String,
     desc: Box<BdevDesc>,
@@ -2255,7 +2325,16 @@ impl Lbdev {
         Rc::new(LbdevIoChannel::new(ch))
     }
 
-    pub fn read<'a>(&self, ch: &LbdevIoChannel, io: Io<'a>) -> LbdevIoResult<'a> {
+    /// Submits read operation to lower SPDK block device.
+    ///
+    /// The returned future borrows `ctx` and must be awaited before `ctx` can
+    /// be dropped or reused.
+    pub fn read<'ctx, 'io>(
+        &self,
+        ch: &LbdevIoChannel,
+        io: &mut Io<'io>,
+        ctx: &'ctx mut LbdevIoCtx,
+    ) -> LbdevIoFuture<'ctx> {
         let (iovs_ptr, iovcnt) = {
             let iovs = io.as_iovs();
             let iovs_ptr = iovs.as_ptr();
@@ -2265,40 +2344,39 @@ impl Lbdev {
         let lba = io.offset_blocks();
         let num_blocks = io.num_blocks();
 
-        let ctx = Rc::new(LbdevIoCtx {
-            io,
-            fut: UnsafeCell::new(IoFuture::new()),
-            success: Cell::new(false),
-        });
-
-        // increase ref count for spdk_rwio_complete_cb()
-        let ctx_ptr = Rc::into_raw(ctx.clone()) as *mut _;
+        let ctx_ptr = ctx as *mut _ as *mut c_void;
 
         let rc = unsafe {
             c::spdk_bdev_readv_blocks(
                 self.desc.raw.as_ptr(),
                 ch.raw.as_ptr(),
-                iovs_ptr as *mut c_void,
+                iovs_ptr as *mut c::iovec,
                 iovcnt as i32,
                 lba,
                 num_blocks as u64,
-                spdk_rwio_complete_cb,
+                Some(spdk_rwio_complete_cb),
                 ctx_ptr,
             )
         };
         if rc != 0 {
             // spdk_bdev_readv_blocks() failed, the callback was not called
-            // need to drop ctx ref count
-            drop(unsafe { Rc::from_raw(ctx_ptr as *const LbdevIoCtx) });
-
             ctx.success.set(false);
             let fut = unsafe { &mut *ctx.fut.get() };
             fut.complete();
         }
-        ctx
+        LbdevIoFuture { ctx }
     }
 
-    pub fn write<'a>(&self, ch: &LbdevIoChannel, io: Io<'a>) -> LbdevIoResult<'a> {
+    /// Submits write operation to lower SPDK block device.
+    ///
+    /// The returned future borrows `ctx` and must be awaited before `ctx` can
+    /// be dropped or reused.
+    pub fn write<'ctx, 'io>(
+        &self,
+        ch: &LbdevIoChannel,
+        io: &mut Io<'io>,
+        ctx: &'ctx mut LbdevIoCtx,
+    ) -> LbdevIoFuture<'ctx> {
         let (iovs_ptr, iovcnt) = {
             let iovs = io.as_iovs();
             let iovs_ptr = iovs.as_ptr();
@@ -2308,37 +2386,27 @@ impl Lbdev {
         let lba = io.offset_blocks();
         let num_blocks = io.num_blocks();
 
-        let ctx = Rc::new(LbdevIoCtx {
-            io,
-            fut: UnsafeCell::new(IoFuture::new()),
-            success: Cell::new(false),
-        });
-
-        // increase ref count for spdk_rwio_complete_cb()
-        let ctx_ptr = Rc::into_raw(ctx.clone()) as *mut _;
+        let ctx_ptr = ctx as *mut _ as *mut c_void;
 
         let rc = unsafe {
             c::spdk_bdev_writev_blocks(
                 self.desc.raw.as_ptr(),
                 ch.raw.as_ptr(),
-                iovs_ptr as *mut c_void,
+                iovs_ptr as *mut c::iovec,
                 iovcnt as i32,
                 lba,
                 num_blocks as u64,
-                spdk_rwio_complete_cb,
+                Some(spdk_rwio_complete_cb),
                 ctx_ptr,
             )
         };
         if rc != 0 {
             // spdk_bdev_writev_blocks() failed, the callback was not called
-            // need to drop ctx ref count
-            drop(unsafe { Rc::from_raw(ctx_ptr as *const LbdevIoCtx) });
-
             ctx.success.set(false);
             let fut = unsafe { &mut *ctx.fut.get() };
             fut.complete();
         }
-        ctx
+        LbdevIoFuture { ctx }
     }
 }
 
@@ -2346,26 +2414,9 @@ impl Lbdev {
 
 /// SPDK bdev options placeholder. Should be used with define_bdev_opts!
 /// macro to generate code which converts RPC arguments to bdev options
-/// Put here fields of 'struct spdk_bdev' which may be passed as RPC arguments
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SpdkBdevOptsC {
-    pub blocklen: u32,
-    pub blockcnt: u64,
-    pub write_cache: bool,
-    pub phys_blocklen: u32,
-    pub split_on_write_unit: u32,
-    pub split_on_optimal_io_boundary: u32,
-    pub md_interleave: u32,
-    pub dif_is_head_of_md: u32,
-    pub write_unit_size: u32,
-    pub optimal_io_boundary: u32,
-    pub preferred_write_alignment: u32,
-    pub preferred_write_granularity: u32,
-    pub optimal_write_size: u32,
-    pub preferred_unmap_alignment: u32,
-    pub preferred_unmap_granularity: u32,
-}
+/// Put here (the definition is in ironspdk_sys/c_src/bdev.h)
+/// fields of 'struct spdk_bdev' which may be passed as RPC arguments
+pub use c::SpdkBdevOptsC;
 
 /// Codegen conversion from RPC arguments to bdev options
 #[macro_export]

@@ -1,6 +1,7 @@
 #include <spdk/event.h>
 #include <spdk/log.h>
 #include <spdk/bdev_module.h>
+#include "shim.h"
 #include "rpc.h"
 #include "util.h"
 
@@ -11,9 +12,9 @@ size_t u_spdk_app_opts_size(void)
     return sizeof(struct spdk_app_opts);
 }
 
-int u_bdev_io_get_type(struct spdk_bdev_io *io)
+unsigned int u_bdev_io_get_type(struct spdk_bdev_io *io)
 {
-    return (int)io->type;
+    return io->type;
 }
 
 uint64_t u_bdev_io_get_offset_blocks(struct spdk_bdev_io *io)
@@ -31,7 +32,7 @@ uint32_t u_bdev_get_blocklen(struct spdk_bdev *bdev)
     return bdev->blocklen;
 }
 
-uint32_t u_bdev_get_blockcnt(struct spdk_bdev *bdev)
+uint64_t u_bdev_get_blockcnt(struct spdk_bdev *bdev)
 {
     return bdev->blockcnt;
 }
