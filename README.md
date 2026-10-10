@@ -1,7 +1,7 @@
 # ironspdk
 
-[![raid1 example CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)
-[![raid5 example CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid5-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid5-simple-test.yml?branch=master)
+[![raid1 example CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master&label=raid1%20example%20CI)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master&label=raid1%20example%20CI)
+[![raid5 example CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid5-simple-test.yml?branch=master&label=raid5%20example%20CI)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid5-simple-test.yml?branch=master&label=raid5%20example%20CI)
 ![License](https://img.shields.io/crates/l/ironspdk?style=flat-square)
 
 Rust runtime for [SPDK](https://spdk.io/). Write high-performance userspace storage drivers in Rust.
