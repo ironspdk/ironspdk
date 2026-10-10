@@ -86,7 +86,7 @@ jobs:
             --bs=512 \
             --iodepth=32 \
             --ioengine=libaio \
-            --numjobs=$(( $(nproc) * 4 )) \
+            --numjobs=1 \
             --time_based \
             --runtime=20 \
             --verify=md5 \
