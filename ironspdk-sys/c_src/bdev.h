@@ -3,7 +3,10 @@
 #include <spdk/bdev.h>
 #include <spdk/bdev_module.h>
 
-// This structure must be synchronized with Rust's structure with same name
+// SPDK bdev options placeholder.
+// Should be used in Rust code with define_bdev_opts!
+// macro to generate code which converts RPC arguments to bdev options
+// Put here fields of 'struct spdk_bdev' which may be passed as RPC arguments
 struct SpdkBdevOptsC {
     uint32_t blocklen;
     uint64_t blockcnt;
@@ -22,6 +25,9 @@ struct SpdkBdevOptsC {
     uint32_t preferred_unmap_granularity;
 };
 
+int u_bdev_open(const char *bdev_name, bool write,
+                struct spdk_bdev_desc **desc);
+
 int u_bdev_destruct(void *ctx);
 
 void u_bdev_submit_request(struct spdk_io_channel *ch,
@@ -36,3 +42,8 @@ struct spdk_bdev *u_bdev_alloc(const char *name,
                                void *bdevctx);
 
 int u_bdev_register(const char *name, struct spdk_bdev *bdev);
+
+int u_spdk_bdev_delete_by_name(const char *name);
+
+void *u_io_channel_get_rust_ctx(void *io_ch_ctx);
+

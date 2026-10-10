@@ -9,6 +9,7 @@ edition = "2024"
 links = "ironspdk-sys"
 
 [build-dependencies]
+bindgen = "0.72.1"
 cc = "1.2.56"
 
 [dependencies]

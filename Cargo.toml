@@ -1,7 +1,10 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "ironspdk-sys",
     "ironspdk",
     "examples/raid1",
 ]
+
+[workspace.dependencies]
+ironspdk-sys = { version = "0.1.14", path = "ironspdk-sys" }

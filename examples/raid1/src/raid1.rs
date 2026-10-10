@@ -5,14 +5,15 @@ use ironspdk::rpc;
 use ironspdk::rpc_register;
 use ironspdk::{
     Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, BdevIoChannelRef, Io, IoStatus, IoType,
-    Lbdev, LbdevIoChannel, RawBdevHandle, SpdkBdevOptsC, SpdkThread, thread_id,
+    Lbdev, LbdevIoChannel, LbdevIoCtx, RawBdevHandle, SpdkBdevOptsC, SpdkThread, thread_id,
 };
 use log::{debug, error, warn};
 use paste::paste;
-use smallvec::SmallVec;
 use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
+
+type Vec<T> = smallvec::SmallVec<[T; 8]>;
 
 struct Raid1IoChannel {
     children: Vec<Rc<Lbdev>>,
@@ -36,7 +37,7 @@ impl Bdev for Raid1Bdev {
 
     fn io_type_supported(&self, io_type: IoType) -> bool {
         // TODO: support RESET, FLUSH, UNMAP
-        matches!(io_type, IoType::Read | IoType::Write | IoType::Flush)
+        matches!(io_type, IoType::Read | IoType::Write)
     }
 
     fn create_io_channel(&self) -> Box<BdevIoChannel> {
@@ -72,10 +73,6 @@ impl Bdev for Raid1Bdev {
             match io.io_type() {
                 IoType::Read => this.read(ch, io).await,
                 IoType::Write => this.write(ch, io).await,
-                IoType::Flush => {
-                    // flush==noop for now. TODO implement flush
-                    io.complete(IoStatus::Success);
-                }
                 _ => {
                     io.complete(IoStatus::Failure);
                 }
@@ -102,17 +99,17 @@ impl Raid1Bdev {
             let next = (ch.next_read + 1) % n;
             ch.next_read = next;
 
-            let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
-            let res = ch.children[next].read(&ch.chans[next], ioref);
-            res.future().await;
-
-            if res.success() {
+            let mut ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
+            let mut ctx = LbdevIoCtx::new();
+            let fut = ch.children[next].read(&ch.chans[next], &mut ioref, &mut ctx);
+            let success = fut.await;
+            if success {
                 status = IoStatus::Success;
                 break;
             }
 
-            // Failover. Read from next child.
-            debug!("FAILOVER #{} {} {:?}", thread_id(), next, io);
+            // Recover. Read from next child.
+            debug!("Recover #{} {} {:?}", thread_id(), next, io);
         }
 
         if status == IoStatus::Failure {
@@ -123,20 +120,29 @@ impl Raid1Bdev {
     }
 
     async fn write(&self, ch: &mut Raid1IoChannel, io: BdevIo) {
-        let mut crs: SmallVec<[_; 4]> = SmallVec::new();
-        for (idx, child) in ch.children.iter().enumerate() {
+        let ndisks = ch.children.len();
+        let mut ios = Vec::with_capacity(ndisks);
+        let mut ctxs = Vec::with_capacity(ndisks);
+        for _ in 0..ndisks {
             let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
-            let child_res = child.write(&ch.chans[idx], ioref);
-            crs.push(child_res);
+            let ctx = LbdevIoCtx::new();
+            ctxs.push(ctx);
+            ios.push(ioref);
         }
+
+        let mut futs = Vec::with_capacity(ndisks);
+
+        for ((idx, ctx), mut io) in ctxs.iter_mut().enumerate().zip(ios) {
+            let fut = ch.children[idx].write(&ch.chans[idx], &mut io, ctx);
+            futs.push(fut);
+        }
+
         let mut status = IoStatus::Failure;
         let mut fail_mask: u64 = 0;
         // Wait until all lower bdevs are done, check results
-        for (idx, child_res) in crs.iter().enumerate() {
-            child_res.future().await;
-
+        for (idx, fut) in futs.into_iter().enumerate() {
             // At least one lower bdev writes successfully. Overall result is SUCCESS
-            if child_res.success() {
+            if fut.await {
                 status = IoStatus::Success;
             } else {
                 fail_mask |= 1 << idx;

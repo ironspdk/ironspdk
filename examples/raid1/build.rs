@@ -1,3 +1,4 @@
+use ironspdk_sys::build_utils;
 use std::env;
 use std::path::Path;
 
@@ -7,7 +8,7 @@ fn build_c_src(spdk_include_dir: &Path) {
         .file("c_src/raid1.c")
         .flag("-isystem")
         .flag(spdk_include_dir.to_str().unwrap())
-        .include(ironspdk_sys::include_dir())
+        .include(build_utils::include_dir())
         .flag("-std=gnu11")
         .cargo_metadata(false);
 
@@ -21,9 +22,9 @@ fn build_c_src(spdk_include_dir: &Path) {
 }
 
 fn main() {
-    ironspdk_sys::emit_preamble();
-    build_c_src(&ironspdk_sys::resolve_spdk_include());
-    ironspdk_sys::emit_rest();
+    build_utils::emit_preamble();
+    build_c_src(&build_utils::resolve_spdk_include());
+    build_utils::emit_rest();
 
     println!("cargo::rerun-if-changed=c_src/");
     println!("cargo::rerun-if-changed=src/");

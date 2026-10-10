@@ -82,10 +82,10 @@ impl SpdkApp {
                 Some(cb) => Box::into_raw(Box::new(cb)) as *mut c_void,
                 None => ptr::null_mut(),
             };
-            c::u_spdk_app_set_shutdown_cb(opts, u_spdk_app_shutdown);
+            c::u_spdk_app_set_shutdown_cb(opts, Some(u_spdk_app_shutdown));
         }
 
-        let rc = unsafe { c::u_spdk_app_start(opts, u_spdk_app_start, start_cx) };
+        let rc = unsafe { c::u_spdk_app_start(opts, Some(u_spdk_app_start), start_cx) };
         if rc != 0 {
             return Err(Error::Start(rc));
         }
