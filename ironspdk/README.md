@@ -314,8 +314,18 @@ impl Lbdev {
     pub fn open(name: &str) -> Result<Self, Error>;
     pub fn desc(&self) -> &BdevDesc;
     pub fn get_io_channel(&self) -> Rc<LbdevIoChannel>;
-    pub fn read(&self, ch: &LbdevIoChannel, ctx: &LbdevIoCtx<'_>);
-    pub fn write(&self, ch: &LbdevIoChannel, ctx: &LbdevIoCtx<'_>);
+    pub fn read<'ctx, 'io>(
+        &self,
+        ch: &LbdevIoChannel,
+        io: &mut Io<'io>,
+        ctx: &'ctx mut LbdevIoCtx,
+    ) -> LbdevIoFuture<'ctx>;
+    pub fn write<'ctx, 'io>(
+        &self,
+        ch: &LbdevIoChannel,
+        io: &mut Io<'io>,
+        ctx: &'ctx mut LbdevIoCtx,
+    ) -> LbdevIoFuture<'ctx>;
 }
 ```
 
@@ -346,7 +356,7 @@ pub enum Error {
 ## Performance Characteristics
 
 - **Latency**: Microsecond-scale I/O latency (same as C SPDK)
-- **Throughput**: Limited only by underlying hardware (no Rust overhead)
+- **Throughput**: Limited only by underlying hardware (Rust overhead is minimal)
 - **CPU efficiency**: Lock-free design with thread-per-core scaling
 - **Memory**: Minimal overhead compared to C implementation
 
@@ -377,6 +387,8 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
+- [x] More public API documentation
+- [x] Documentation at docs.rs
 - [ ] Test coverage (cargo test)
 - [ ] Additional block device examples (encryption, RAID5)
 - [ ] T10 PI (DIF/DIX) support
