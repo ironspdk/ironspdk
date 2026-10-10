@@ -2238,6 +2238,11 @@ impl LbdevIoChannel {
     }
 }
 
+/// Non-boxed context for lower-layer bdev I/O. It is used to avoid recreating
+/// IoFuture for each I/O operation. It is used by Lbdev::{read|write}()
+/// methods.
+/// Caller of Lbdev::{read|write}() can store `LbdevIoCtx`-s on the stack or
+/// in the vector and reuse them for multiple I/O operations.
 pub struct LbdevIoCtx {
     fut: UnsafeCell<IoFuture>,
     success: Cell<bool>,
@@ -2259,10 +2264,10 @@ impl Default for LbdevIoCtx {
 }
 
 /// Future returned from Lbdev::{read|write}().
-/// It references LbdevIoCtx. It is statically ensured
-/// it cannot outlive it.
+/// It references `LbdevIoCtx`, so it is statically ensured
+/// this future cannot outlive related `LbdevIoCtx`.
 /// # Safety
-/// [`LbdevIoFuture`] _must_ be awaited before related LbdevIoCtx is dropped.
+/// [`LbdevIoFuture`] _must_ be awaited before related `LbdevIoCtx` is dropped.
 #[must_use]
 pub struct LbdevIoFuture<'ctx> {
     ctx: &'ctx mut LbdevIoCtx,
