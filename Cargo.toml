@@ -8,4 +8,4 @@ members = [
 ]
 
 [workspace.dependencies]
-ironspdk-sys = { version = "0.2.1", path = "ironspdk-sys" }
+ironspdk-sys = { version = "0.2.2", path = "ironspdk-sys" }
