@@ -1,6 +1,7 @@
 # ironspdk
 
-[![CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)
+[![raid1 example CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid1-simple-test.yml?branch=master)
+[![raid5 example CI](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid5-simple-test.yml?branch=master)](https://img.shields.io/github/actions/workflow/status/ironspdk/ironspdk/raid5-simple-test.yml?branch=master)
 ![License](https://img.shields.io/crates/l/ironspdk?style=flat-square)
 
 Rust runtime for [SPDK](https://spdk.io/). Write high-performance userspace storage drivers in Rust.
@@ -72,6 +73,7 @@ ironspdk/              # High-level Rust runtime and abstractions
   ├── c_enum.rs        # Enum conversions
   └── rpc.rs           # RPC command registration
 examples/raid1/        # Simple RAID1 implementation example
+examples/raid5/        # Minimal reference RAID5 implementation example
 ```
 
 ### Runtime Executor
@@ -91,11 +93,11 @@ Add to your `Cargo.toml`:
 ```toml
 [build-dependencies]
 cc = "1.2.56"
-ironspdk-sys = "0.1"
+ironspdk-sys = "0.2"
 
 [dependencies]
-ironspdk-sys = "0.1"
-ironspdk = "0.1"
+ironspdk-sys = "0.2"
+ironspdk = "0.2"
 ```
 
 ### Create a Simple Block Device
@@ -169,6 +171,17 @@ The repository includes a simple yet functional RAID1 implementation (`examples/
 
 **Compare with SPDK's C implementation `raid1.c`**: The Rust version is significantly more concise and readable, while maintaining almost identical performance.
 
+### RAID5 Block Device
+
+A simple RAID5 implementation (`examples/raid5/`). This example demonstrates:
+- Data striping with distributed XOR parity
+- Full-stripe writes and partial-stripe writes using read-modify-write (RMW)
+- Recovery of a single failed read using parity reconstruction
+- Per-stripe request serialization to prevent concurrent RMW operations from corrupting parity
+- RPC-based management interface
+
+This is a reference implementation intended to demonstrate RAID5 concepts, not a production-ready solution. It does not provide crash consistency or persistent failure tracking.
+
 #### Running the RAID1 Example
 
 ```bash
@@ -209,6 +222,16 @@ sudo PYTHONPATH=/path/to/ironspdk/ ./scripts/rpc.py \
 sudo ./scripts/rpc.py bdev_malloc_delete malloc2
 sudo ./scripts/rpc.py bdev_malloc_delete malloc1
 sudo ./scripts/rpc.py bdev_malloc_delete malloc0
+```
+
+#### Running RAID5 Example
+
+This is similar to RAID1. The block device creation command is:
+
+```
+sudo PYTHONPATH=/path/to/ironspdk/examples/raid5/ ./scripts/rpc.py \
+    --plugin raid5 \
+    rs_raid5_create --name my_ironspdk_raid5 -z 16 -c malloc0,malloc1,malloc2
 ```
 
 ## API Overview
@@ -389,8 +412,9 @@ Contributions are welcome! Please:
 
 - [x] More public API documentation
 - [x] Documentation at docs.rs
+- [x] RAID5 example
 - [ ] Test coverage (cargo test)
-- [ ] Additional block device examples (encryption, RAID5)
+- [ ] Additional block device examples
 - [ ] T10 PI (DIF/DIX) support
 - [ ] SPDK bdev resizing support
 - [ ] Performance profiling tools
