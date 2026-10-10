@@ -4,6 +4,7 @@ members = [
     "ironspdk-sys",
     "ironspdk",
     "examples/raid1",
+    "examples/raid5",
 ]
 
 [workspace.dependencies]
