@@ -9,10 +9,11 @@ use ironspdk::{
 };
 use log::{debug, error, warn};
 use paste::paste;
-use smallvec::SmallVec;
 use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
+
+type Vec<T> = smallvec::SmallVec<[T; 8]>;
 
 struct Raid1IoChannel {
     children: Vec<Rc<Lbdev>>,
@@ -120,8 +121,8 @@ impl Raid1Bdev {
 
     async fn write(&self, ch: &mut Raid1IoChannel, io: BdevIo) {
         let ndisks = ch.children.len();
-        let mut ios: SmallVec<[_; 4]> = SmallVec::with_capacity(ndisks);
-        let mut ctxs: SmallVec<[_; 4]> = SmallVec::with_capacity(ndisks);
+        let mut ios = Vec::with_capacity(ndisks);
+        let mut ctxs = Vec::with_capacity(ndisks);
         for _ in 0..ndisks {
             let ioref = Io::from_bdev_io(&io, io.block_len()).expect("Cannot convert to IoRef");
             let ctx = LbdevIoCtx::new();
@@ -129,7 +130,7 @@ impl Raid1Bdev {
             ios.push(ioref);
         }
 
-        let mut futs: SmallVec<[_; 4]> = SmallVec::with_capacity(ndisks);
+        let mut futs = Vec::with_capacity(ndisks);
 
         for ((idx, ctx), mut io) in ctxs.iter_mut().enumerate().zip(ios) {
             let fut = ch.children[idx].write(&ch.chans[idx], &mut io, ctx);
