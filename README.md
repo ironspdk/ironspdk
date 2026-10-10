@@ -224,7 +224,7 @@ sudo ./scripts/rpc.py bdev_malloc_delete malloc1
 sudo ./scripts/rpc.py bdev_malloc_delete malloc0
 ```
 
-#### Running RAID5 Example
+#### Running the RAID5 Example
 
 This is similar to RAID1. The block device creation command is:
 
