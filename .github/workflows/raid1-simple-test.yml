@@ -88,6 +88,7 @@ jobs:
             --numjobs=$(( $(nproc) * 4 )) \
             --time_based \
             --runtime=20 \
+            --verify=md5 \
             --name=test
 
       - name: Shutdown
