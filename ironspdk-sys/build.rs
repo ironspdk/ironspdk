@@ -1,6 +1,6 @@
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 // Macros for C FFI generation
 
@@ -30,6 +30,14 @@ macro_rules! allowlist_functions {
                 .allowlist_function(concat!("^", $name, "$"));
         )+
     };
+}
+
+fn create_fake_docsrs_ffi(manifest_dir: &Path, out_dir: &Path) {
+    fs::copy(
+        manifest_dir.join("src/ffi_docsrs.rs"),
+        out_dir.join("ffi.rs"),
+    )
+    .expect("missing prebuiit ffi for docs.rs");
 }
 
 fn generate_ffi(spdk_include_dir: &Path, out_dir: &Path) {
@@ -213,18 +221,23 @@ fn main() {
         "cargo:rustc-env=IRONSPDK_INCLUDE_DIR={}",
         ironspdk_include_dir.display()
     );
-    let spdk_include_dir = resolve_spdk_include();
-    build_shim(&spdk_include_dir);
 
     // pass OUT_DIR of ironspdk-sys to dependent crates
     let out_dir = env::var("OUT_DIR").unwrap();
     println!("cargo:metadata={}", out_dir);
 
     let out_dir_path = PathBuf::from(out_dir);
-    generate_ffi(&spdk_include_dir, &out_dir_path);
+    if env::var_os("DOCS_RS").is_some() {
+        create_fake_docsrs_ffi(&manifest_dir, &out_dir_path);
+    } else {
+        let spdk_include_dir = resolve_spdk_include();
+        build_shim(&spdk_include_dir);
+        generate_ffi(&spdk_include_dir, &out_dir_path);
+    }
 
     println!("cargo::rerun-if-changed=c_src/");
     println!("cargo::rerun-if-changed=src/");
     println!("cargo::rerun-if-env-changed=SPDK");
     println!("cargo::rerun-if-env-changed=CARGO_MANIFEST_DIR");
+    println!("cargo::rerun-if-env-changed=DOCS_RS");
 }

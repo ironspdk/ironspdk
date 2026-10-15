@@ -557,7 +557,7 @@ impl IoBuf {
 ///
 /// Splitting operates on the byte range covered by the parent I/O rather than
 /// on its individual I/O vectors. Consequently, a child may begin or end in
-/// the middle of an [`iovec`]. The resulting child still references the
+/// the middle of an `iovec`. The resulting child still references the
 /// original memory and preserves the parent's scatter/gather layout for the
 /// portion it covers.
 ///
