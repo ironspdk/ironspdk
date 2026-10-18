@@ -202,7 +202,7 @@ sudo ./scripts/rpc.py bdev_malloc_create -b malloc2 64 512
 # Create RAID1 instance
 sudo PYTHONPATH=/path/to/ironspdk/examples/raid1/ ./scripts/rpc.py \
     --plugin raid1 \
-    rs_raid1_create --name my_ironspdk_raid1 -c malloc0,malloc1,malloc2
+    rs_raid1_create --name my_ironspdk_raid1 -c "malloc0 malloc1 malloc2"
 
 # Export via ublk and benchmark with fio
 sudo modprobe ublk_drv
@@ -231,7 +231,7 @@ This is similar to RAID1. The block device creation command is:
 ```
 sudo PYTHONPATH=/path/to/ironspdk/examples/raid5/ ./scripts/rpc.py \
     --plugin raid5 \
-    rs_raid5_create --name my_ironspdk_raid5 -z 16 -c malloc0,malloc1,malloc2
+    rs_raid5_create --name my_ironspdk_raid5 -z 16 -c "malloc0 malloc1 malloc2"
 ```
 
 ## API Overview

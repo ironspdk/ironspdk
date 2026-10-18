@@ -843,7 +843,10 @@ fn parse_children(children_names: &Vec<&str>) -> Result<(usize, u64), Error> {
 fn rpc_rs_raid5_create(args: rpc::RpcCmdArgs) -> rpc::RpcCmdResult {
     let name = args.get("name").ok_or(Error::InvalidArguments)?;
     let children_names_cs = args.get("children").ok_or(Error::InvalidArguments)?;
-    let children_names: Vec<&str> = children_names_cs.split(',').collect();
+    let children_names: Vec<&str> = children_names_cs
+        .split(' ')
+        .filter(|name| !name.is_empty())
+        .collect();
     let ndisks = children_names.len();
     if ndisks < 3 {
         error!("Need at least 3 children disks");
