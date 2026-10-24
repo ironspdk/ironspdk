@@ -62,6 +62,8 @@ features are useful for implementing storage logic.
 
 ## Architecture
 
+For the design rationale behind `ironspdk`, including its execution model and performance measurements, see [Rust + SPDK](https://ekorenevsky.github.io/2026/10/12/rust-plus-spdk.html).
+
 ### Core Components
 
 ```
@@ -413,6 +415,7 @@ Contributions are welcome! Please:
 - [x] More public API documentation
 - [x] Documentation at docs.rs
 - [x] RAID5 example
+- [ ] SIMD optimizations
 - [ ] Test coverage (cargo test)
 - [ ] Additional block device examples
 - [ ] T10 PI (DIF/DIX) support
