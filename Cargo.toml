@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.dependencies]
-ironspdk-sys = { version = "0.2.3", path = "ironspdk-sys" }
+ironspdk-sys = { version = "0.2.4", path = "ironspdk-sys" }
 
 # Debug symbols are turned ON in release builds of examples
 # to simplify profiling and troubleshooting
