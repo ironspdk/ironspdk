@@ -210,7 +210,10 @@ fn parse_children(children_names: &Vec<&str>) -> Result<(usize, u64), Error> {
 fn rpc_rs_raid1_create(args: rpc::RpcCmdArgs) -> rpc::RpcCmdResult {
     let name = args.get("name").ok_or(Error::InvalidArguments)?;
     let children_names_cs = args.get("children").ok_or(Error::InvalidArguments)?;
-    let children_names: Vec<&str> = children_names_cs.split(',').collect();
+    let children_names: Vec<&str> = children_names_cs
+        .split(' ')
+        .filter(|name| !name.is_empty())
+        .collect();
     let (blocklen, num_blocks) = parse_children(&children_names)?;
 
     let bdevh: BdevHandle = Arc::new(Raid1Bdev::new(name, children_names)?);

@@ -9,3 +9,10 @@ members = [
 
 [workspace.dependencies]
 ironspdk-sys = { version = "0.2.3", path = "ironspdk-sys" }
+
+# Debug symbols are turned ON in release builds of examples
+# to simplify profiling and troubleshooting
+[profile.release.package.raid1]
+debug = 2
+[profile.release.package.raid5]
+debug = 2
