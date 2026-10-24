@@ -66,7 +66,7 @@ jobs:
           sudo PYTHONPATH=./examples/raid5/scripts \
             $SPDK/scripts/rpc.py --plugin raid5 rs_raid5_create --name r5 \
             -z 16 \
-            -c malloc0,malloc1,malloc2,malloc3,malloc4
+            -c "malloc0 malloc1 malloc2 malloc3 malloc4"
 
       - name: Create NBD block device
         run: |
