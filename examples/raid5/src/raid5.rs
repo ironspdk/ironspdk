@@ -5,8 +5,8 @@ use ironspdk::rpc;
 use ironspdk::rpc_register;
 use ironspdk::{
     Bdev, BdevCtx, BdevHandle, BdevIo, BdevIoChannel, BdevIoChannelRef, DmaBuf, Io, IoStatus,
-    IoType, Lbdev, LbdevIoChannel, LbdevIoCtx, RawBdevHandle, RcBdevIoChannel, SpdkBdevOptsC,
-    SpdkThread, TlsKey, thread_id,
+    IoType, Lbdev, LbdevIoChannel, LbdevIoCtx, RawBdevHandle, RcBdevIoChannel, SendPtr,
+    SpdkBdevOptsC, SpdkThread, TlsKey, thread_id,
 };
 use log::{debug, error};
 use paste::paste;
@@ -170,9 +170,9 @@ impl Bdev for Raid5Bdev {
         let owner_idx = self.owner_idx(stripe_idx);
         let owner = self.workers[owner_idx].clone();
         let sender = SpdkThread::current();
-        let this_ptr = self as *const Raid5Bdev;
+        let this_ptr = SendPtr::new(self);
         owner.spawn(async move {
-            let this = unsafe { &*this_ptr };
+            let this = unsafe { this_ptr.get() };
             let refch = IOCH_TLS.get().expect("I/O channel not found");
             let ch = refch.downcast_mut::<Raid5IoChannel>();
 

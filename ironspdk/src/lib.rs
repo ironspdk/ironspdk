@@ -1125,6 +1125,45 @@ impl RcBdevIoChannel {
     }
 }
 
+/// The helper type for passing a pointer to a Rust object between
+/// SPDK threads. This operation is unsafe yet it is required for
+/// real applications.
+pub struct SendPtr<T: ?Sized>(NonNull<T>);
+
+impl<T: ?Sized> Copy for SendPtr<T> {}
+
+impl<T: ?Sized> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// SAFETY: T: Sync permits shared access from multiple threads.
+// The caller must still ensure the pointed-to object remains alive.
+unsafe impl<T: Sync + ?Sized> Send for SendPtr<T> {}
+
+impl<T: ?Sized> SendPtr<T> {
+    pub fn new(ptr: &T) -> Self {
+        Self(NonNull::from(ptr))
+    }
+
+    /// Returns `None` if `ptr` is null.
+    pub fn from_raw(ptr: *mut T) -> Option<Self> {
+        NonNull::new(ptr).map(Self)
+    }
+
+    /// # Safety
+    /// The pointed-to object must remain alive for the returned
+    /// reference's lifetime.
+    pub unsafe fn get<'a>(&self) -> &'a T {
+        unsafe { &*self.0.as_ptr() }
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.0.as_ptr()
+    }
+}
+
 /// A Rust implementation of an SPDK block device.
 ///
 /// Implement this trait to expose a Rust object as an SPDK bdev. The
@@ -1295,7 +1334,7 @@ pub trait Bdev {
 pub type BdevHandle = Arc<dyn Bdev + Send + Sync + 'static>;
 
 /// Handle for passing bdevs between `ironspdk` SpdkThread-s
-pub type RawBdevHandle = NonNull<c::spdk_bdev>;
+pub type RawBdevHandle = SendPtr<c::spdk_bdev>;
 
 pub struct BdevCtx {
     pub name: String,
@@ -1413,7 +1452,8 @@ extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: c_ui
 #[unsafe(no_mangle)]
 extern "C" fn rsu_bdev_init(bdev_ctxt: *mut c_void) {
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
-    let rawbdev = NonNull::new(ctx.spdk_bdev).expect("bdev pointer must not be NULL");
+    let rawbdev = RawBdevHandle::from_raw(ctx.spdk_bdev)
+        .expect("spdk_bdev pointer must not be NULL");
     ctx.bdev.init(rawbdev);
 }
 
