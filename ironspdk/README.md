@@ -136,7 +136,7 @@ impl Bdev for MyBdev {
 
     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
         // Handle I/O requests asynchronously
-        SpdkThread::current().spawn(async move {
+        SpdkThread::spawn_local(async move {
             // Process I/O...
             io.complete(IoStatus::Success);
         });
