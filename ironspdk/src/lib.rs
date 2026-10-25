@@ -1025,8 +1025,7 @@ impl BdevIoChannel {
 ///     fn create_io_channel(&self) -> Box<BdevIoChannel> { todo!() }
 ///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
 ///         // ... process I/O ...
-///         let submit_thread = SpdkThread::current();
-///         submit_thread.spawn(async move {
+///         SpdkThread::spawn_local(async move {
 ///             let ch = ch.downcast_mut::<MyIoChannel>();
 ///             // ... use channel ...
 ///         });
