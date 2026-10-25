@@ -128,7 +128,7 @@ impl Bdev for Raid5Bdev {
         // We must create a thread-local I/O channel for each worker thread
         // to submit I/O
         for w in &self.workers {
-            w.spawn(async move {
+            w.spawn(move || async move {
                 // Obtain an I/O channel for current bdev+thread
                 let refch = RcBdevIoChannel::new(rawbdev);
                 // Put the I/O channel into thread-local storage
@@ -171,7 +171,7 @@ impl Bdev for Raid5Bdev {
         let owner = self.workers[owner_idx].clone();
         let sender = SpdkThread::current();
         let this_ptr = SendPtr::new(self);
-        owner.spawn(async move {
+        owner.spawn(move || async move {
             let this = unsafe { this_ptr.get() };
             let refch = IOCH_TLS.get().expect("I/O channel not found");
             let ch = refch.downcast_mut::<Raid5IoChannel>();
