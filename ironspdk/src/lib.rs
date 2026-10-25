@@ -851,6 +851,13 @@ impl std::fmt::Debug for BdevIo {
     }
 }
 
+// SAFETY:
+// In SPDK, the thread on which an I/O is submitted can pass the I/O to
+// another thread for completion. Therefore, BdevIo must be Send.
+// However, after passing the I/O to another thread, the original thread
+// must not access the BdevIo anymore, except to complete it.
+unsafe impl Send for BdevIo {}
+
 impl BdevIo {
     /// Creates a new BdevIo wrapper from a raw SPDK pointer.
     pub fn new(raw: *mut c::spdk_bdev_io) -> Self {
@@ -1125,6 +1132,45 @@ impl RcBdevIoChannel {
     }
 }
 
+/// The helper type for passing a pointer to a Rust object between
+/// SPDK threads. This operation is unsafe yet it is required for
+/// real applications.
+pub struct SendPtr<T: ?Sized>(NonNull<T>);
+
+impl<T: ?Sized> Copy for SendPtr<T> {}
+
+impl<T: ?Sized> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// SAFETY: T: Sync permits shared access from multiple threads.
+// The caller must still ensure the pointed-to object remains alive.
+unsafe impl<T: Sync + ?Sized> Send for SendPtr<T> {}
+
+impl<T: ?Sized> SendPtr<T> {
+    pub fn new(ptr: &T) -> Self {
+        Self(NonNull::from(ptr))
+    }
+
+    /// Returns `None` if `ptr` is null.
+    pub fn from_raw(ptr: *mut T) -> Option<Self> {
+        NonNull::new(ptr).map(Self)
+    }
+
+    /// # Safety
+    /// The pointed-to object must remain alive for the returned
+    /// reference's lifetime.
+    pub unsafe fn get<'a>(&self) -> &'a T {
+        unsafe { &*self.0.as_ptr() }
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.0.as_ptr()
+    }
+}
+
 /// A Rust implementation of an SPDK block device.
 ///
 /// Implement this trait to expose a Rust object as an SPDK bdev. The
@@ -1274,7 +1320,7 @@ impl RcBdevIoChannel {
 ///     }
 ///
 ///     fn submit_io(&self, ch: BdevIoChannelRef, io: BdevIo) {
-///         SpdkThread::current().spawn(async move {
+///         SpdkThread::current().spawn(move || async move {
 ///             // Process `io` using `channel`.
 ///             io.complete(IoStatus::Success);
 ///         });
@@ -1295,7 +1341,7 @@ pub trait Bdev {
 pub type BdevHandle = Arc<dyn Bdev + Send + Sync + 'static>;
 
 /// Handle for passing bdevs between `ironspdk` SpdkThread-s
-pub type RawBdevHandle = NonNull<c::spdk_bdev>;
+pub type RawBdevHandle = SendPtr<c::spdk_bdev>;
 
 pub struct BdevCtx {
     pub name: String,
@@ -1413,7 +1459,8 @@ extern "C" fn rsu_bdev_io_type_supported(bdev_ctxt: *mut c_void, c_io_type: c_ui
 #[unsafe(no_mangle)]
 extern "C" fn rsu_bdev_init(bdev_ctxt: *mut c_void) {
     let ctx: &BdevCtx = unsafe { &*(bdev_ctxt as *const BdevCtx) };
-    let rawbdev = NonNull::new(ctx.spdk_bdev).expect("bdev pointer must not be NULL");
+    let rawbdev =
+        RawBdevHandle::from_raw(ctx.spdk_bdev).expect("spdk_bdev pointer must not be NULL");
     ctx.bdev.init(rawbdev);
 }
 
@@ -1627,15 +1674,49 @@ impl SpdkThread {
         }
     }
 
-    /// Spawns a future on this thread.
+    /// Spawns a future on this SPDK thread.
     ///
-    /// The future will be polled on the thread's reactor.
-    pub fn spawn<F>(&self, fut: F)
+    /// `make` is sent to this (the target) thread and called there, so the
+    /// future is created, polled and dropped on the target thread only. The
+    /// future does not need to be `Send`; only `make` must be, because it is
+    /// the only thing that crosses threads. Create `!Send` values (`Rc`, I/O
+    /// channels, ...) inside `make`, not before it.
+    ///
+    /// To spawn a future on the current thread, use
+    /// [`SpdkThread::spawn_local`], which needs no `Send` at all.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::{cell::Cell, rc::Rc};
+    /// use ironspdk::SpdkThread;
+    ///
+    /// let worker = SpdkThread::new_at_cores("worker", [1]);
+    /// // The `Rc` is created on the worker thread, so it never crosses threads.
+    /// worker.spawn(|| {
+    ///     let counter = Rc::new(Cell::new(0));
+    ///     async move { counter.set(counter.get() + 1) }
+    /// });
+    /// ```
+    ///
+    /// Moving a `!Send` value from the calling thread into `make` is rejected:
+    ///
+    /// ```compile_fail
+    /// use std::rc::Rc;
+    /// use ironspdk::SpdkThread;
+    ///
+    /// let worker = SpdkThread::new("worker");
+    /// let rc = Rc::new(0);
+    /// worker.spawn(move || async move { rc.clone(); }); // error: `Rc` cannot be sent between threads safely
+    /// ```
+    pub fn spawn<MakeFut, Fut>(&self, make: MakeFut)
     where
-        F: Future<Output = ()> + 'static,
+        MakeFut: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
     {
         self.send_msg(move || {
             let tcb = Tcb::current();
+            let fut = make();
             tcb.spawn(fut);
         });
     }
