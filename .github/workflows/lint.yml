@@ -35,4 +35,6 @@ jobs:
 
       - name: make lint
         run: |
-          make lint
+          SPDK=./extern/spdk
+          sudo $SPDK/scripts/pkgdep.sh
+          make test-build lint
