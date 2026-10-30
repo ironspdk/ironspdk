@@ -29,6 +29,8 @@ fmt:
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo fmt --
 
 lint:
+	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
+	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo test --locked --doc --workspace
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo fmt -- --check
 	SPDK=$(SPDK) PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) cargo clippy --locked --all --all-targets --tests -- -D warnings
 
