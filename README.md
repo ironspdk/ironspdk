@@ -258,7 +258,7 @@ Wrapper around SPDK threads. Enables spawning async tasks and inter-thread commu
 let thread = SpdkThread::new_at_cores("my_thread", [2]);
 
 // run some code at this SPDK thread asynchronously
-thread.spawn(async { /* async work */ });
+thread.spawn(move || async move { /* async work */ });
 
 // stop SPDK threads this way only
 thread.request_exit();

@@ -375,10 +375,10 @@ impl<'a> IoRef<'a> {
     ///
     /// # Parameters
     ///
-    /// * `block_len` - Block length for newli created IoRef.
+    /// * `block_len` - Block length for newly created IoRef.
     ///
     ///  SANITY: this parameter is not checked for sanity
-    ///  (for zero, for alignment) doe to performance-related
+    ///  (for zero, for alignment) due to performance-related
     ///  reasons. The caller is responsible for its sanity.
     ///
     /// # Returns
@@ -1948,7 +1948,7 @@ impl Tls {
 // This facilitates survival if and when SPDK migrates spdk_thread to other reactor
 //
 std::thread_local! {
-    // 0 means “no cache”. spdk_thread IDs start at 1.
+    // 0 means "no cache". spdk_thread IDs start at 1.
     static CACHED_THREAD_ID: Cell<u64> = const { Cell::new(0) };
     static CACHED_TCB: Cell<*const Tcb> = const { Cell::new(std::ptr::null()) };
 }
