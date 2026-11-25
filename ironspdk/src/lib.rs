@@ -1654,21 +1654,21 @@ impl SpdkThread {
     where
         F: FnOnce() + 'static,
     {
-        extern "C" fn trampoline(ctx: *mut c_void) {
-            let f = unsafe { Box::<Box<dyn FnOnce()>>::from_raw(ctx as _) };
+        // One monomorphized trampoline per concrete closure type.
+        extern "C" fn trampoline<F: FnOnce()>(ctx: *mut c_void) {
+            let f = unsafe { Box::from_raw(ctx as *mut F) };
             f();
         }
 
-        let boxed: Box<Box<dyn FnOnce()>> = Box::new(Box::new(f));
+        // Single allocation, thin pointer — no dyn, no vtable, no second box.
+        let ctx = Box::into_raw(Box::new(f));
 
         let rc = unsafe {
-            c::spdk_thread_send_msg(
-                self.raw.as_ptr(),
-                Some(trampoline),
-                Box::into_raw(boxed) as *mut _,
-            )
+            c::spdk_thread_send_msg(self.raw.as_ptr(), Some(trampoline::<F>), ctx as *mut c_void)
         };
         if rc != 0 {
+            // Reclaim the box so the failure path doesn't leak it.
+            drop(unsafe { Box::from_raw(ctx) });
             panic!("spdk_thread_send_msg failed: {}", rc);
         }
     }
